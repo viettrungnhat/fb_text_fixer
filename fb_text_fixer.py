@@ -18,6 +18,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import StaleElementReferenceException
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ─── Quy tắc thay thế (sẽ đọc từ UI) ─────────────────────────────────────────
@@ -58,6 +59,7 @@ class App(tk.Tk):
         self.logged_in = False
         self.posts = []   # [{el, text}, ...]
         self._stop_flag = False
+        self._auto_login_started = False
 
         # Profile-specific paths
         base_dir = os.path.dirname(__file__)
@@ -69,6 +71,7 @@ class App(tk.Tk):
         self.comment_text_var = tk.StringVar(value="")
         self.comment_image_path = tk.StringVar(value="")
         self.comment_mode_var = tk.StringVar(value="sequential")
+        self.comment_old_posts_var = tk.BooleanVar(value=True)
         self.comment_post_count = tk.IntVar(value=3)  # Number of old posts to comment on
         self.monitor_enabled_var = tk.BooleanVar(value=False)
         self.monitor_interval_var = tk.IntVar(value=5)
@@ -112,6 +115,13 @@ class App(tk.Tk):
         self._load_comment_config()
         self._load_approval_config()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Sau khi UI sẵn sàng, tự động mở Chrome & kiểm tra đăng nhập Facebook một lần.
+        # Người dùng vẫn có thể nhấn nút "Mở Chrome & Đăng nhập" như cũ nếu cần.
+        try:
+            self.after(1200, self._auto_login_on_start)
+        except Exception:
+            pass
 
     # ══════════════════════════════════════════════════════════════════════════
     def _build_ui(self):
@@ -1579,6 +1589,23 @@ class App(tk.Tk):
         self.log_box.tag_config("info", foreground=FG_MUTED)
 
 
+    def _auto_login_on_start(self):
+        """Tự động mở Chrome & kiểm tra đăng nhập khi mới mở app.
+
+        Chỉ chạy một lần, nếu đã có driver hoặc đã đăng nhập thì bỏ qua.
+        Người dùng vẫn có thể bấm nút đăng nhập thủ công như trước.
+        """
+        try:
+            if self.logged_in or self.driver or self._auto_login_started:
+                return
+            self._auto_login_started = True
+            self._log("🔄  Tự động mở Chrome & kiểm tra đăng nhập Facebook...", "info")
+            self._do_login()
+        except Exception:
+            # Không để lỗi auto login làm crash app
+            self._auto_login_started = False
+
+
     # ── Tab 2: Auto Comment Nhóm ──────────────────────────────────────────────
     def _build_tab_comment(self, parent):
         # ─ Top Control Row - ALL ACTION BUTTONS HERE ─
@@ -1661,7 +1688,14 @@ class App(tk.Tk):
         post_count_row = tk.Frame(sf, bg=BG_DARK)
         post_count_row.pack(fill="x", padx=14, pady=(6, 3))  # Reduced padding
         
-        tk.Label(post_count_row, text="Số bài viết cũ để comment:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left", padx=(0, 10))
+        tk.Checkbutton(post_count_row,
+                   text="Comment bài cũ khi bấm Bắt đầu",
+                   variable=self.comment_old_posts_var,
+                   font=FONT, bg=BG_DARK, fg=FG_LIGHT,
+                   activebackground=BG_DARK, activeforeground=ACCENT,
+                   selectcolor=BG_DARK).pack(side="left", padx=(0, 12))
+
+        tk.Label(post_count_row, text="Số bài cũ:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left", padx=(0, 8))
         tk.Spinbox(post_count_row, from_=1, to=50, textvariable=self.comment_post_count, width=5,
                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
@@ -4093,12 +4127,17 @@ class App(tk.Tk):
                         )
                 except Exception:
                     pass
-                # Scroll the sidebar until it truly can't scroll further / no more groups load
+                # Scroll the sidebar để FB load thêm nhóm.
+                # Với chế độ chỉ lấy nhóm DO BẠN QUẢN LÝ, các nhóm này thường nằm ngay trên đầu,
+                # nên không cần cuộn quá sâu (tránh mất thời gian).
                 stable_rounds = 0
                 last_link_count = -1
                 last_scroll_height = -1
                 last_scroll_top = -1
                 max_rounds = 140
+                if managers_only:
+                    # Giới hạn vòng cuộn khi chỉ cần nhóm quản trị (đủ để mở "Xem thêm").
+                    max_rounds = 24
 
                 for round_idx in range(max_rounds):
                     # Click "Xem thêm" / "See more" inside sidebar if present
@@ -4176,9 +4215,15 @@ class App(tk.Tk):
                         last_scroll_height = sh
                         last_scroll_top = st
 
-                        # Don't stop too early; allow FB to lazy-load
-                        if (round_idx + 1) >= 24 and stable_rounds >= 8:
-                            break
+                        # Với tất cả nhóm: đợi tới khi cuộn chạm đáy và ổn định lâu.
+                        # Với chỉ nhóm quản trị: ưu tiên tốc độ, dừng sau ~10 vòng đầu tiên.
+                        if managers_only:
+                            if (round_idx + 1) >= 10:
+                                break
+                        else:
+                            # Don't stop too early; allow FB to lazy-load
+                            if (round_idx + 1) >= 24 and stable_rounds >= 8:
+                                break
 
                 self._log("  ✅ Đã cuộn sidebar đến khi ổn định", "info")
             else:
@@ -4519,7 +4564,76 @@ class App(tk.Tk):
         except Exception:
             self.driver.get(group_url)
 
-        time.sleep(4)
+        # Chờ trang pending load rõ ràng hơn để tránh báo thiếu bài do load chậm
+        time.sleep(2)
+        pending_count_hint = None
+        for _ in range(16):
+            try:
+                probe = self.driver.execute_script(
+                    """
+                    function txt(el){ return (el && (el.innerText || el.textContent) || '').trim(); }
+                    function norm(s){ return (s||'').toLowerCase(); }
+
+                    var bodyText = norm(document.body ? (document.body.innerText || '') : '');
+
+                    // Tìm số ở tiêu đề kiểu: "Bài viết đang chờ · 2" hoặc "Pending posts · 2"
+                    var pendingCount = null;
+                    var candidates = Array.from(document.querySelectorAll('h1, h2, h3, span, div'));
+                    for (var i = 0; i < candidates.length; i++) {
+                        var t = txt(candidates[i]);
+                        if (!t) continue;
+                        var l = norm(t);
+                        if (l.indexOf('bài viết đang chờ') !== -1 || l.indexOf('pending posts') !== -1) {
+                            var m = t.match(/(\d+)/);
+                            if (m && m[1]) { pendingCount = parseInt(m[1], 10); break; }
+                        }
+                    }
+
+                    var approveRejectBtns = 0;
+                    var nodes = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    for (var j = 0; j < nodes.length; j++) {
+                        var b = norm(txt(nodes[j]));
+                        if (!b) continue;
+                        if (
+                            b.indexOf('phê duyệt') !== -1 || b.indexOf('phe duyet') !== -1 || b.indexOf('approve') !== -1 ||
+                            b.indexOf('từ chối') !== -1 || b.indexOf('tu choi') !== -1 || b.indexOf('decline') !== -1 || b.indexOf('reject') !== -1
+                        ) {
+                            approveRejectBtns++;
+                        }
+                    }
+
+                    var articleCount = document.querySelectorAll('div[role="article"]').length;
+                    return {
+                        pendingCount: pendingCount,
+                        approveRejectBtns: approveRejectBtns,
+                        articleCount: articleCount,
+                        hasPendingText: bodyText.indexOf('bài viết đang chờ') !== -1 || bodyText.indexOf('pending posts') !== -1
+                    };
+                    """
+                ) or {}
+            except Exception:
+                probe = {}
+
+            if isinstance(probe, dict):
+                if probe.get("pendingCount") is not None:
+                    try:
+                        pending_count_hint = int(probe.get("pendingCount"))
+                    except Exception:
+                        pass
+
+                # Trang đã sẵn sàng khi có nút duyệt/từ chối hoặc có article
+                if int(probe.get("approveRejectBtns") or 0) > 0 or int(probe.get("articleCount") or 0) > 0:
+                    break
+
+                # Nếu có text pending_posts nhưng chưa render nút, chờ thêm
+                if probe.get("hasPendingText"):
+                    time.sleep(0.6)
+                    continue
+
+            time.sleep(0.6)
+
+        if pending_count_hint is not None:
+            self._log(f"  ℹ [Duyệt bài] Trang đang chờ duyệt báo: {pending_count_hint} bài", "info")
 
         # Cuộn nhẹ để FB load danh sách
         try:
@@ -4537,9 +4651,109 @@ class App(tk.Tk):
 
         posts = []
         try:
+            # Giao diện cũ: mỗi bài là 1 div[role="article"]
             posts = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
         except Exception:
             posts = []
+
+        # Nếu không tìm thấy gì, thử giao diện mới: dò theo nút "Phê duyệt" / "Từ chối"
+        if not posts:
+            try:
+                posts = self.driver.execute_script(
+                    """
+                    function norm(s){ return (s||'').toLowerCase(); }
+
+                    // Tìm tất cả các nút có text liên quan tới Phê duyệt / Từ chối
+                    var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    var roots = [];
+                    var seen = new Set();
+
+                    function findRoot(el){
+                        var cur = el;
+                        // Đi lên tối đa 8 cấp để tìm khối bao quanh bài viết
+                        for (var i=0; i<8 && cur; i++){
+                            try {
+                                var role = (cur.getAttribute && cur.getAttribute('role')) || '';
+                                if (role === 'article') return cur;
+                            } catch(e) {}
+                            cur = cur.parentElement;
+                        }
+                        return el.parentElement || el;
+                    }
+
+                    for (var i=0; i<btns.length; i++){
+                        var t = norm(btns[i].innerText || btns[i].textContent);
+                        if (!t) continue;
+                        if (
+                            t.indexOf('phê duyệt') !== -1 || t.indexOf('phe duyet') !== -1 ||
+                            t.indexOf('duyệt') !== -1      ||
+                            t.indexOf('approve') !== -1    ||
+                            t.indexOf('chấp thuận') !== -1 ||
+                            t.indexOf('chap thuan') !== -1 ||
+                            t.indexOf('từ chối') !== -1    || t.indexOf('tu choi') !== -1 ||
+                            t.indexOf('decline') !== -1    || t.indexOf('reject') !== -1
+                        ){
+                            var root = findRoot(btns[i]);
+                            if (!root) continue;
+                            // Dùng toạ độ + chiều cao để phân biệt, tránh trùng lặp
+                            var r;
+                            try { r = root.getBoundingClientRect(); } catch(e) { r = null; }
+                            var key = '';
+                            if (r) {
+                                key = [Math.round(r.top), Math.round(r.left), Math.round(r.width), Math.round(r.height)].join(':');
+                            } else {
+                                key = String(i);
+                            }
+                            if (!seen.has(key)){
+                                seen.add(key);
+                                roots.push(root);
+                            }
+                        }
+                    }
+                    return roots;
+                    """
+                ) or []
+            except Exception:
+                posts = []
+
+        if not posts:
+            # Nếu tiêu đề báo vẫn còn bài chờ duyệt, thử làm tươi nhẹ rồi quét lại 1 lần
+            if pending_count_hint is not None and pending_count_hint > 0:
+                try:
+                    self.driver.execute_script("window.scrollTo(0, 0);")
+                    time.sleep(0.8)
+                    self.driver.execute_script("window.scrollBy(0, 600);")
+                    time.sleep(0.8)
+                    posts = self.driver.execute_script(
+                        """
+                        function norm(s){ return (s||'').toLowerCase(); }
+                        var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                        var roots = [];
+                        var seen = new Set();
+                        function findRoot(el){
+                            var cur = el;
+                            for (var i=0; i<10 && cur; i++){
+                                try { if ((cur.getAttribute && cur.getAttribute('role')) === 'article') return cur; } catch(e) {}
+                                cur = cur.parentElement;
+                            }
+                            return el.parentElement || el;
+                        }
+                        for (var i=0; i<btns.length; i++){
+                            var t = norm(btns[i].innerText || btns[i].textContent);
+                            if (!t) continue;
+                            if (t.indexOf('phê duyệt')!==-1 || t.indexOf('phe duyet')!==-1 || t.indexOf('approve')!==-1 || t.indexOf('từ chối')!==-1 || t.indexOf('tu choi')!==-1 || t.indexOf('decline')!==-1 || t.indexOf('reject')!==-1){
+                                var root = findRoot(btns[i]);
+                                if (!root) continue;
+                                var r = root.getBoundingClientRect();
+                                var key = [Math.round(r.top), Math.round(r.left), Math.round(r.width), Math.round(r.height)].join(':');
+                                if (!seen.has(key)) { seen.add(key); roots.push(root); }
+                            }
+                        }
+                        return roots;
+                        """
+                    ) or []
+                except Exception:
+                    posts = []
 
         if not posts:
             self._log("ℹ Không tìm thấy bài chờ duyệt nào (hoặc giao diện khác).", "info")
@@ -4558,74 +4772,84 @@ class App(tk.Tk):
                 break
 
             try:
-                text = self.driver.execute_script(
-                    "return (arguments[0].innerText || arguments[0].textContent || '').toLowerCase();",
-                    post,
-                )
-            except Exception:
-                text = ""
+                # Lấy text bài viết
+                try:
+                    text = self.driver.execute_script(
+                        "return (arguments[0].innerText || arguments[0].textContent || '').toLowerCase();",
+                        post,
+                    )
+                except Exception:
+                    text = ""
 
-            text = text or ""
-            is_suspicious = False
-            for kw in blocked_keywords:
-                if kw and kw in text:
-                    is_suspicious = True
-                    break
+                text = text or ""
+                is_suspicious = False
+                for kw in blocked_keywords:
+                    if kw and kw in text:
+                        is_suspicious = True
+                        break
 
-            action = None  # "approve" | "reject" | None
-            if is_suspicious:
-                action = "reject"
-            elif self.approval_auto_approve_safe.get():
-                action = "approve"
+                action = None  # "approve" | "reject" | None
+                if is_suspicious:
+                    action = "reject"
+                elif self.approval_auto_approve_safe.get():
+                    action = "approve"
 
-            if not action:
+                if not action:
+                    continue
+
+                # Tìm nút phù hợp bên trong post
+                if action == "approve":
+                    clicked = self.driver.execute_script(
+                        """
+                        var root = arguments[0];
+                        if (!root) return false;
+                        function norm(s){return (s||'').toLowerCase();}
+                        var btns = root.querySelectorAll('button, [role="button"]');
+                        for (var i=0;i<btns.length;i++){
+                            var t = norm(btns[i].innerText || btns[i].textContent);
+                            if (!t) continue;
+                            if (t.indexOf('phê duyệt')!==-1 || t.indexOf('duyệt')!==-1 || t.indexOf('approve')!==-1 || t.indexOf('chấp thuận')!==-1){
+                                try { btns[i].click(); return true; } catch(e) {}
+                            }
+                        }
+                        return false;
+                        """,
+                        post,
+                    )
+                    if clicked:
+                        approved += 1
+                else:
+                    clicked = self.driver.execute_script(
+                        """
+                        var root = arguments[0];
+                        if (!root) return false;
+                        function norm(s){return (s||'').toLowerCase();}
+                        var btns = root.querySelectorAll('button, [role="button"]');
+                        for (var i=0;i<btns.length;i++){
+                            var t = norm(btns[i].innerText || btns[i].textContent);
+                            if (!t) continue;
+                            if (t.indexOf('từ chối')!==-1 || t.indexOf('tu choi')!==-1 || t.indexOf('decline')!==-1 || t.indexOf('reject')!==-1){
+                                try { btns[i].click(); return true; } catch(e) {}
+                            }
+                        }
+                        return false;
+                        """,
+                        post,
+                    )
+                    if clicked:
+                        rejected += 1
+
+                if clicked:
+                    processed += 1
+                    time.sleep(1.0)
+
+            except StaleElementReferenceException:
+                # Bài viết đã bị FB reload / DOM thay đổi khi đang duyệt -> bỏ qua bài này
+                self._log("⚠️ Một bài chờ duyệt đã thay đổi trong khi xử lý (stale element), bỏ qua bài đó.", "warn")
                 continue
-
-            # Tìm nút phù hợp bên trong post
-            if action == "approve":
-                clicked = self.driver.execute_script(
-                    """
-                    var root = arguments[0];
-                    if (!root) return false;
-                    function norm(s){return (s||'').toLowerCase();}
-                    var btns = root.querySelectorAll('button');
-                    for (var i=0;i<btns.length;i++){
-                        var t = norm(btns[i].innerText || btns[i].textContent);
-                        if (!t) continue;
-                        if (t.indexOf('phê duyệt')!==-1 || t.indexOf('duyệt')!==-1 || t.indexOf('approve')!==-1 || t.indexOf('chấp thuận')!==-1){
-                            try { btns[i].click(); return true; } catch(e) {}
-                        }
-                    }
-                    return false;
-                    """,
-                    post,
-                )
-                if clicked:
-                    approved += 1
-            else:
-                clicked = self.driver.execute_script(
-                    """
-                    var root = arguments[0];
-                    if (!root) return false;
-                    function norm(s){return (s||'').toLowerCase();}
-                    var btns = root.querySelectorAll('button');
-                    for (var i=0;i<btns.length;i++){
-                        var t = norm(btns[i].innerText || btns[i].textContent);
-                        if (!t) continue;
-                        if (t.indexOf('từ chối')!==-1 || t.indexOf('tu choi')!==-1 || t.indexOf('decline')!==-1 || t.indexOf('reject')!==-1){
-                            try { btns[i].click(); return true; } catch(e) {}
-                        }
-                    }
-                    return false;
-                    """,
-                    post,
-                )
-                if clicked:
-                    rejected += 1
-
-            if clicked:
-                processed += 1
-                time.sleep(1.0)
+            except Exception as e:
+                self._log(f"⚠️ Lỗi khi xử lý một bài chờ duyệt: {e}", "warn")
+                continue
 
         self._log(
             f"✅ [Duyệt bài] Đã xử lý {processed} bài (phê duyệt {approved}, từ chối {rejected}) trong {group_url}",
@@ -4646,6 +4870,14 @@ class App(tk.Tk):
         comment_text = self.comment_textbox.get("1.0", "end-1c").strip()
         if not comment_text:
             messagebox.showwarning("Chưa có nội dung", "Vui lòng nhập nội dung comment!")
+            return
+
+        if (not self.comment_old_posts_var.get()) and (not self.monitor_enabled_var.get()):
+            messagebox.showwarning(
+                "Chưa chọn chế độ chạy",
+                "Bạn đã tắt 'Comment bài cũ' và cũng chưa bật monitor bài mới.\n"
+                "Hãy bật ít nhất một trong hai.",
+            )
             return
         
         self.is_commenting = True
@@ -4677,40 +4909,52 @@ class App(tk.Tk):
         """Comment on groups sequentially (one by one)."""
         img_path = self.comment_image_path.get()
         post_count = self.comment_post_count.get()
+        comment_old = bool(self.comment_old_posts_var.get())
         
-        # Phase 1: Comment on old posts
-        self._log(f"📝 [Phase 1] Comment bài cũ...", "info")
-        for i, group_url in enumerate(group_urls):
-            if not self.is_commenting:
-                break
-            
-            try:
-                group_name = self.selected_groups[group_url]['name']
-                self._log(f"[{i+1}/{len(group_urls)}] 📝 Comment vào: {group_name}", "info")
-                
-                # Navigate to group
-                self.driver.get(group_url)
-                time.sleep(3)
-                
-                # Comment on old posts (check_duplicates=False for first run)
-                self._comment_on_group_posts(comment_text, img_path, post_count, check_duplicates=False)
-
+        # Phase 1: Comment on old posts (optional)
+        if comment_old:
+            self._log("📝 [Phase 1] Comment bài cũ...", "info")
+            for i, group_url in enumerate(group_urls):
                 if not self.is_commenting:
                     break
-                
-                self._log(f"✅ Hoàn tất: {group_name}", "ok")
-                time.sleep(2)  # Delay between groups
-                
-            except Exception as e:
-                self._log(f"❌ Lỗi ở nhóm {group_url}: {e}", "err")
+
+                try:
+                    group_name = self.selected_groups[group_url]['name']
+                    self._log(f"[{i+1}/{len(group_urls)}] 📝 Comment vào: {group_name}", "info")
+
+                    # Navigate to group
+                    self.driver.get(group_url)
+                    time.sleep(3)
+
+                    # Comment on old posts (check_duplicates=False for first run)
+                    self._comment_on_group_posts(comment_text, img_path, post_count, check_duplicates=False)
+
+                    if not self.is_commenting:
+                        break
+
+                    self._log(f"✅ Hoàn tất: {group_name}", "ok")
+                    time.sleep(2)  # Delay between groups
+
+                except Exception as e:
+                    self._log(f"❌ Lỗi ở nhóm {group_url}: {e}", "err")
+        else:
+            self._log("⏭️ [Phase 1] Bỏ qua comment bài cũ (theo lựa chọn).", "info")
 
         if not self.is_commenting:
             return
 
-        self._log(f"🎉 [Phase 1] Đã comment xong tất cả bài cũ!", "ok")
+        if comment_old:
+            self._log("🎉 [Phase 1] Đã comment xong tất cả bài cũ!", "ok")
         
         # Phase 2: Start monitor mode if enabled
         if self.monitor_enabled_var.get() and self.is_commenting:
+            if not comment_old:
+                # Nếu chỉ chạy monitor, đánh dấu baseline để không comment các bài đã tồn tại trước đó.
+                try:
+                    monitor_cap = max(1, int(self.comment_post_count.get() or 1))
+                except Exception:
+                    monitor_cap = 3
+                self._prime_monitor_baseline(group_urls, cap=monitor_cap)
             self._log(f"🔔 [Phase 2] Bắt đầu monitor bài mới...", "info")
             self._start_monitor()
         else:
@@ -5553,6 +5797,79 @@ class App(tk.Tk):
         self.monitor_stop_event.clear()
         self.monitor_thread = threading.Thread(target=self._monitor_worker, daemon=True)
         self.monitor_thread.start()
+
+    def _prime_monitor_baseline(self, group_urls, cap=3):
+        """Đánh dấu các bài hiện có là 'đã thấy' để monitor chỉ comment bài mới về sau."""
+        try:
+            cap = max(1, int(cap or 1))
+        except Exception:
+            cap = 3
+
+        self._log(f"🧭 [Monitor] Đang lấy mốc ban đầu ({cap} bài gần nhất/nhóm)...", "info")
+
+        seeded = 0
+        for idx, group_url in enumerate(group_urls):
+            if not self.is_commenting:
+                break
+            try:
+                group_name = self.selected_groups.get(group_url, {}).get('name', group_url)
+                self._log(f"  🧭 [{idx+1}/{len(group_urls)}] Ghi nhận bài hiện có: {group_name}", "info")
+                self.driver.get(group_url)
+                time.sleep(2)
+
+                uids = self.driver.execute_script(
+                    """
+                    var cap = Math.max(1, parseInt(arguments[0] || 3, 10));
+                    var out = [];
+                    var seen = new Set();
+
+                    function pushUid(v){
+                        if (!v) return;
+                        if (seen.has(v)) return;
+                        seen.add(v);
+                        out.push(v);
+                    }
+
+                    var articles = Array.from(document.querySelectorAll('div[role="article"]'));
+                    for (var i=0; i<articles.length && out.length < cap; i++) {
+                        var art = articles[i];
+                        var links = Array.from(art.querySelectorAll('a[href*="/posts/"], a[href*="story_fbid="], a[href*="permalink"], a[href*="/groups/"]'));
+                        var uid = null;
+                        for (var j=0; j<links.length; j++) {
+                            var href = links[j].href || '';
+                            if (!href) continue;
+                            var m1 = href.match(/story_fbid=(\d+)/);
+                            var m2 = href.match(/\/posts\/(\d+)/);
+                            var m3 = href.match(/\/permalink\/(\d+)/);
+                            if (m1 && m1[1]) { uid = 's:' + m1[1]; break; }
+                            if (m2 && m2[1]) { uid = 'p:' + m2[1]; break; }
+                            if (m3 && m3[1]) { uid = 'pl:' + m3[1]; break; }
+                        }
+                        if (!uid) {
+                            var txt = (art.innerText || art.textContent || '').trim();
+                            if (txt) {
+                                var small = txt.slice(0, 180).replace(/\s+/g, ' ');
+                                uid = 'txt:' + small;
+                            }
+                        }
+                        if (uid) pushUid(uid);
+                    }
+                    return out;
+                    """,
+                    cap,
+                ) or []
+
+                for uid in uids:
+                    if isinstance(uid, str) and uid:
+                        if uid.startswith('txt:'):
+                            self.commented_posts_hash.add(hash(uid))
+                        else:
+                            self.commented_posts_uid.add(uid)
+                        seeded += 1
+            except Exception as e:
+                self._log(f"  ⚠️ [Monitor] Không lấy được baseline nhóm {group_url}: {e}", "warn")
+
+        self._log(f"✅ [Monitor] Đã ghi nhận baseline {seeded} bài hiện có.", "ok")
     
     def _monitor_worker(self):
         """Worker thread for monitoring new posts."""
@@ -5632,6 +5949,7 @@ class App(tk.Tk):
                 "comment_text": self.comment_textbox.get("1.0", "end-1c").strip(),
                 "image_path": self.comment_image_path.get(),
                 "mode": self.comment_mode_var.get(),
+                "comment_old_posts": self.comment_old_posts_var.get(),
                 "post_count": self.comment_post_count.get(),
                 "monitor_enabled": self.monitor_enabled_var.get(),
                 "monitor_interval": self.monitor_interval_var.get(),
@@ -5674,6 +5992,9 @@ class App(tk.Tk):
             
             if 'mode' in config:
                 self.comment_mode_var.set(config['mode'])
+
+            if 'comment_old_posts' in config:
+                self.comment_old_posts_var.set(bool(config['comment_old_posts']))
             
             if 'post_count' in config:
                 self.comment_post_count.set(config['post_count'])
