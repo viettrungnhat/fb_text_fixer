@@ -1,0 +1,6 @@
+2026/02/25-17:24:04.456 2918 Creating DB C:\Users\Public\fb_text_fixer\fb_chrome_profile\Default\IndexedDB\https_music.youtube.com_0.indexeddb.leveldb since it was missing.
+2026/02/25-17:24:04.464 2918 Reusing MANIFEST C:\Users\Public\fb_text_fixer\fb_chrome_profile\Default\IndexedDB\https_music.youtube.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/02/25-17:24:08.576 2918 Level-0 table #5: started
+2026/02/25-17:24:08.577 2918 Level-0 table #5: 35590 bytes OK
+2026/02/25-17:24:08.578 2918 Delete type=0 #3
+2026/02/25-17:24:08.579 2918 Manual compaction at level-0 from (begin) .. (end); will stop at (end)
