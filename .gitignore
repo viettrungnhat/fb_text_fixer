@@ -1,0 +1,8 @@
+# Bỏ qua thư mục profile của Chrome
+fb_chrome_profile/
+chrome_profile/
+chrome_work_profile/
+
+# Bỏ qua file biên dịch Python
+__pycache__/
+*.py[cod]

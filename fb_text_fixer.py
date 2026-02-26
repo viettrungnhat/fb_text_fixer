@@ -63,9 +63,9 @@ class App(tk.Tk):
         base_dir = os.path.dirname(__file__)
         profile_suffix = f"_{profile_name}" if profile_name != "default" else ""
 
-        # Auto-comment tab vars
+        # Auto-comment tab vars (bình luận vào bài trong nhóm)
         self.config_file = os.path.join(base_dir, f"fb_comment_config{profile_suffix}.json")
-        self.selected_groups = {}  # {group_url: BooleanVar}
+        self.selected_groups = {}  # {group_url: {var, name}}
         self.comment_text_var = tk.StringVar(value="")
         self.comment_image_path = tk.StringVar(value="")
         self.comment_mode_var = tk.StringVar(value="sequential")
@@ -77,6 +77,17 @@ class App(tk.Tk):
         self.monitor_stop_event = threading.Event()
         self.commented_posts_hash = set()  # Track commented posts by text hash to avoid duplicates
         self.commented_posts_uid = set()   # Track commented posts by permalink/story id (more reliable)
+
+        # Group approval tab vars (duyệt bài trong nhóm)
+        self.approval_config_file = os.path.join(base_dir, f"fb_approval_config{profile_suffix}.json")
+        self.approval_selected_groups = {}  # {group_url: {var, name}}
+        self.approval_interval_var = tk.IntVar(value=5)  # phút giữa các lần quét
+        self.approval_mode_var = tk.StringVar(value="interval")  # "once" hoặc "interval"
+        self.approval_auto_approve_safe = tk.BooleanVar(value=True)
+        self.approval_thread = None
+        self.approval_stop_event = threading.Event()
+        self.approval_keywords_box = None  # sẽ gán trong UI
+        self.approval_group_list_frame = None
 
         # Scheduler (auto-post on personal profile)
         self.schedule_config_file = os.path.join(base_dir, f"fb_schedule_config{profile_suffix}.json")
@@ -99,6 +110,7 @@ class App(tk.Tk):
 
         self._build_ui()
         self._load_comment_config()
+        self._load_approval_config()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -127,10 +139,12 @@ class App(tk.Tk):
         tab1 = tk.Frame(nb, bg=BG_DARK); nb.add(tab1, text="🔑  Đăng nhập & Tự động sửa")
         tab2 = tk.Frame(nb, bg=BG_DARK); nb.add(tab2, text="💬  Auto Comment Nhóm")
         tab3 = tk.Frame(nb, bg=BG_DARK); nb.add(tab3, text="🗓️  Đăng bài theo lịch")
+        tab4 = tk.Frame(nb, bg=BG_DARK); nb.add(tab4, text="✅  Duyệt bài nhóm")
 
         self._build_tab_auto(tab1)
         self._build_tab_comment(tab2)
         self._build_tab_scheduler(tab3)
+        self._build_tab_group_approval(tab4)
 
         # Status bar
         self.status_var = tk.StringVar(value="Sẵn sàng.")
@@ -1682,6 +1696,147 @@ class App(tk.Tk):
                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(6, 6))
         tk.Label(mon_row, text="phút", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+
+
+    # ── Tab 4: Auto duyệt bài nhóm ───────────────────────────────────────────
+    def _build_tab_group_approval(self, parent):
+        # Top control row
+        top_control = tk.Frame(parent, bg=BG_DARK)
+        top_control.pack(fill="x", padx=14, pady=(10, 6))
+
+        # Left: group actions
+        left_btns = tk.Frame(top_control, bg=BG_DARK)
+        left_btns.pack(side="left")
+
+        self._btn(left_btns, "🔄  Tải nhóm", self._fetch_groups_for_approval, ACCENT).pack(side="left", padx=(0, 6))
+        self._btn(left_btns, "☑️  Chọn tất cả", lambda: self._toggle_all_approval_groups(True), "#6ab04c").pack(side="left", padx=(0, 6))
+        self._btn(left_btns, "☐  Bỏ chọn", lambda: self._toggle_all_approval_groups(False), "#2d2d44").pack(side="left")
+
+        # Right: start/stop + save
+        right_btns = tk.Frame(top_control, bg=BG_DARK)
+        right_btns.pack(side="right")
+
+        self.btn_start_approval = self._btn(right_btns, "▶️  Bắt đầu", self._start_group_approval, ACCENT)
+        self.btn_start_approval.pack(side="left", padx=(0, 6))
+
+        self.btn_stop_approval = self._btn(right_btns, "⏹  Dừng", self._stop_group_approval, "#e74c3c")
+        self.btn_stop_approval.pack(side="left", padx=(0, 6))
+
+        self._btn(right_btns, "💾  Lưu", self._save_approval_config, "#6ab04c").pack(side="left")
+
+        # Group selection
+        gf = tk.LabelFrame(parent, text="  Chọn nhóm Facebook (hãy chọn các nhóm bạn là quản trị viên)  ",
+                           font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+        gf.pack(fill="x", padx=14, pady=(4, 6))
+
+        group_canvas_frame = tk.Frame(gf, bg=BG_DARK)
+        group_canvas_frame.pack(fill="x", padx=10, pady=(4, 8))
+
+        group_canvas = tk.Canvas(group_canvas_frame, bg=BG_PANEL, highlightthickness=0, height=200)
+        group_scrollbar = tk.Scrollbar(group_canvas_frame, orient="vertical", command=group_canvas.yview)
+        self.approval_group_list_frame = tk.Frame(group_canvas, bg=BG_PANEL)
+
+        group_canvas.create_window((0, 0), window=self.approval_group_list_frame, anchor="nw")
+        group_canvas.configure(yscrollcommand=group_scrollbar.set)
+
+        group_canvas.pack(side="left", fill="both", expand=True)
+        group_scrollbar.pack(side="right", fill="y")
+
+        def _on_group_frame_configure(event):
+            group_canvas.configure(scrollregion=group_canvas.bbox("all"))
+
+        self.approval_group_list_frame.bind("<Configure>", _on_group_frame_configure)
+
+        # Criteria
+        cf = tk.LabelFrame(parent, text="  Tiêu chí tự động từ chối / phê duyệt  ",
+                           font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+        cf.pack(fill="x", padx=14, pady=(4, 4))
+
+        tk.Label(cf, text="Danh sách từ khoá nghi lừa đảo / vi phạm (mỗi dòng 1 từ/ký tự):",
+                 font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(anchor="w", padx=14, pady=(6, 2))
+
+        self.approval_keywords_box = scrolledtext.ScrolledText(
+            cf,
+            font=FONT_M,
+            height=4,
+            bg=BG_PANEL,
+            fg=FG_LIGHT,
+            insertbackground=FG_LIGHT,
+            relief="flat",
+            wrap="word",
+        )
+        self.approval_keywords_box.pack(fill="x", padx=14, pady=(0, 6))
+
+        tk.Label(cf,
+                 text="Ví dụ: đa cấp, vay tiền, đầu tư lợi nhuận cao, cho vay nóng...",
+                 font=FONT, bg=BG_DARK, fg=YELLOW).pack(anchor="w", padx=18, pady=(0, 4))
+
+        opt_row = tk.Frame(cf, bg=BG_DARK)
+        opt_row.pack(fill="x", padx=14, pady=(0, 6))
+
+        tk.Checkbutton(
+            opt_row,
+            text="Tự động PHÊ DUYỆT các bài không chứa từ khoá xấu",
+            variable=self.approval_auto_approve_safe,
+            font=FONT,
+            bg=BG_DARK,
+            fg=FG_LIGHT,
+            activebackground=BG_DARK,
+            activeforeground=ACCENT,
+            selectcolor=BG_DARK,
+        ).pack(anchor="w")
+
+        # Schedule
+        sf = tk.LabelFrame(parent, text="  Lịch quét & duyệt bài  ",
+                           font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+        sf.pack(fill="x", padx=14, pady=(4, 6))
+
+        mode_row = tk.Frame(sf, bg=BG_DARK)
+        mode_row.pack(fill="x", padx=14, pady=(6, 2))
+
+        tk.Radiobutton(
+            mode_row,
+            text="Chạy 1 lần (ngay bây giờ)",
+            variable=self.approval_mode_var,
+            value="once",
+            font=FONT,
+            bg=BG_DARK,
+            fg=FG_LIGHT,
+            activebackground=BG_DARK,
+            activeforeground=ACCENT,
+            selectcolor=BG_DARK,
+        ).pack(anchor="w")
+
+        tk.Radiobutton(
+            mode_row,
+            text="Lặp lại, quét bài chờ duyệt theo chu kỳ",
+            variable=self.approval_mode_var,
+            value="interval",
+            font=FONT,
+            bg=BG_DARK,
+            fg=FG_LIGHT,
+            activebackground=BG_DARK,
+            activeforeground=ACCENT,
+            selectcolor=BG_DARK,
+        ).pack(anchor="w")
+
+        interval_row = tk.Frame(sf, bg=BG_DARK)
+        interval_row.pack(fill="x", padx=14, pady=(0, 6))
+
+        tk.Label(interval_row, text="Chu kỳ quét:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(
+            interval_row,
+            from_=1,
+            to=120,
+            textvariable=self.approval_interval_var,
+            width=5,
+            font=FONT,
+            bg=BG_PANEL,
+            fg=FG_LIGHT,
+            buttonbackground=BG_CARD,
+            relief="flat",
+        ).pack(side="left", padx=(6, 6))
+        tk.Label(interval_row, text="phút", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
 
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -3849,15 +4004,15 @@ class App(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
     
     def _fetch_groups(self):
-        """Fetch list of joined Facebook groups."""
+        """Fetch list of joined Facebook groups (cho tab Auto Comment)."""
         if not self.logged_in:
             messagebox.showwarning("Chưa đăng nhập", "Vui lòng đăng nhập Facebook trước!")
             return
-        
-        self._log("🔄 Đang tải danh sách nhóm...", "info")
-        threading.Thread(target=self._fetch_groups_worker, daemon=True).start()
-    
-    def _fetch_groups_worker(self):
+
+        self._log("🔄 Đang tải danh sách nhóm (tất cả nhóm bạn tham gia)...", "info")
+        threading.Thread(target=self._fetch_groups_worker, args=(False,), daemon=True).start()
+
+    def _fetch_groups_worker(self, managers_only=False):
         try:
             # Navigate to groups page
             # Use Groups Feed view because it reliably shows the left "Nhóm của tôi" sidebar
@@ -4041,44 +4196,83 @@ class App(tk.Tk):
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
             
-            # Extract groups - SIMPLIFIED approach
+            # Extract groups - có thể lọc chỉ các nhóm bạn quản lý
             groups_js = """
             var groups = [];
             var seen = new Set();
-            
+
+            var onlyManaged = !!arguments[1];
+
             // If a sidebar element is provided, prefer extracting from it
             var root = arguments[0] || document;
+
+            // Xác định khoảng toạ độ Y cho khu vực "Nhóm do bạn quản lý"
+            var managedTop = null;
+            var managedBottom = null;
+            if (onlyManaged) {
+                try {
+                    var labels = root.querySelectorAll('div, span');
+                    for (var i = 0; i < labels.length; i++) {
+                        var t = (labels[i].innerText || '').toLowerCase().trim();
+                        if (!t) continue;
+                        if (t.indexOf('nhóm do bạn quản lý') !== -1 || t.indexOf('groups you manage') !== -1) {
+                            var r1 = labels[i].getBoundingClientRect();
+                            managedTop = r1.top - 5;
+                            // Tìm tiêu đề tiếp theo "Nhóm bạn đã tham gia / Groups you've joined" để làm đáy
+                            for (var j = i + 1; j < labels.length; j++) {
+                                var t2 = (labels[j].innerText || '').toLowerCase().trim();
+                                if (!t2) continue;
+                                if (t2.indexOf('nhóm bạn đã tham gia') !== -1 || t2.indexOf("groups you've joined") !== -1) {
+                                    var r2 = labels[j].getBoundingClientRect();
+                                    managedBottom = r2.top - 5;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                } catch (e) {}
+            }
+
             var allLinks = root.querySelectorAll('a[href*="/groups/"]');
-            
+
             allLinks.forEach(function(link) {
                 try {
                     var href = link.href;
-                    
+
                     // Match numeric or vanity URL
                     var match = href.match(/\\/groups\\/(\\d+)/) || href.match(/\\/groups\\/([a-zA-Z0-9._-]+)/);
                     if (!match || !match[1]) return;
-                    
+
                     var groupId = match[1];
-                    
+
                     // Skip if already seen
                     if (seen.has(groupId)) return;
-                    
+
+                    // Nếu chỉ lấy nhóm do bạn quản lý thì dùng toạ độ để lọc theo vùng
+                    if (onlyManaged && managedTop !== null) {
+                        var lr = link.getBoundingClientRect();
+                        var cy = (lr.top + lr.bottom) / 2;
+                        if (cy < managedTop) return;
+                        if (managedBottom !== null && cy > managedBottom) return;
+                    }
+
                     // Get link position - prefer left sidebar (x < 450)
                     var isLeftSidebar = true;
                     if (root === document) {
                         var rect = link.getBoundingClientRect();
                         isLeftSidebar = rect.left < 450;
                     }
-                    
+
                     // Get text content
-                    var name = link.textContent.trim();
-                    
+                    var name = (link.textContent || '').trim();
+
                     // Skip navigation/system items
                     if (!name || name.length < 3 || name.length > 150) return;
-                    if (name === 'Nhóm' || name === 'Groups' || name === 'Tìm kiếm' || 
+                    if (name === 'Nhóm' || name === 'Groups' || name === 'Tìm kiếm' ||
                         name === 'Search' || name === 'Thông báo' || name === 'Notification' ||
                         name === 'Xem thêm' || name === 'See more' || name === 'Feed') return;
-                    
+
                     seen.add(groupId);
                     groups.push({
                         name: name,
@@ -4089,14 +4283,14 @@ class App(tk.Tk):
                     // Skip on error
                 }
             });
-            
+
             // Sort: left sidebar items first
             groups.sort(function(a, b) {
                 if (a.isLeftSidebar && !b.isLeftSidebar) return -1;
                 if (!a.isLeftSidebar && b.isLeftSidebar) return 1;
                 return 0;
             });
-            
+
             // Deduplicate by name
             var uniqueGroups = [];
             var seenNames = new Set();
@@ -4107,19 +4301,25 @@ class App(tk.Tk):
                     uniqueGroups.push({name: g.name, url: g.url});
                 }
             }
-            
+
             return uniqueGroups;
             """
             
-            groups = self.driver.execute_script(groups_js, sidebar_elem) or []
+            groups = self.driver.execute_script(groups_js, sidebar_elem, bool(managers_only)) or []
             
             if not groups:
                 self._log("⚠️ Không tìm thấy nhóm nào. Thử cuộn thêm hoặc kiểm tra quyền truy cập.", "warn")
                 return
             
-            # Update UI with groups
-            self._update_group_list(groups)
-            self._log(f"✅ Đã tải {len(groups)} nhóm", "ok")
+            # Update UI: tuỳ theo chế độ gọi (tất cả nhóm hay chỉ nhóm quản lý)
+            if managers_only:
+                # Chỉ cập nhật tab duyệt bài nhóm
+                self._update_approval_group_list(groups)
+                self._log(f"✅ Đã tải {len(groups)} nhóm do bạn quản lý", "ok")
+            else:
+                # Chỉ cập nhật tab Auto Comment
+                self._update_group_list(groups)
+                self._log(f"✅ Đã tải {len(groups)} nhóm (tất cả nhóm bạn tham gia)", "ok")
             
         except Exception as e:
             self._log(f"❌ Lỗi khi tải nhóm: {e}", "err")
@@ -4154,6 +4354,51 @@ class App(tk.Tk):
         """Select or deselect all groups."""
         for group_data in self.selected_groups.values():
             group_data['var'].set(select)
+
+    def _fetch_groups_for_approval(self):
+        """Tải nhóm RIÊNG cho tab duyệt bài (chỉ nhóm bạn quản lý)."""
+        if not self.logged_in:
+            messagebox.showwarning("Chưa đăng nhập", "Vui lòng đăng nhập Facebook trước!")
+            return
+
+        self._log("🔄 Đang tải danh sách NHÓM DO BẠN QUẢN LÝ...", "info")
+        threading.Thread(target=self._fetch_groups_worker, args=(True,), daemon=True).start()
+
+    # --- Group list helpers for approval tab ---
+    def _update_approval_group_list(self, groups):
+        """Update checkbox list for approval tab (reuses same group source)."""
+        if not self.approval_group_list_frame:
+            return
+
+        for widget in self.approval_group_list_frame.winfo_children():
+            widget.destroy()
+        self.approval_selected_groups.clear()
+
+        for group in groups:
+            var = tk.BooleanVar(value=False)
+            self.approval_selected_groups[group['url']] = {'var': var, 'name': group['name']}
+
+            display_name = group['name'] if len(group['name']) <= 80 else f"{group['name'][:77]}..."
+            chk = tk.Checkbutton(
+                self.approval_group_list_frame,
+                text=display_name,
+                variable=var,
+                font=FONT,
+                bg=BG_PANEL,
+                fg=FG_LIGHT,
+                activebackground=BG_PANEL,
+                activeforeground=ACCENT,
+                selectcolor=BG_PANEL,
+                anchor="w",
+                wraplength=900,
+            )
+            chk.pack(fill="x", padx=10, pady=1)
+
+        self._log(f"  📋 Hiển thị {len(groups)} nhóm trong tab duyệt bài", "info")
+
+    def _toggle_all_approval_groups(self, select: bool):
+        for group_data in self.approval_selected_groups.values():
+            group_data['var'].set(select)
     
     def _choose_image(self):
         """Open file dialog to choose image."""
@@ -4164,6 +4409,228 @@ class App(tk.Tk):
         if filename:
             self.comment_image_path.set(filename)
             self._log(f"📷 Đã chọn ảnh: {os.path.basename(filename)}", "info")
+
+    # ── Logic tự động duyệt bài nhóm ────────────────────────────────────────
+    def _start_group_approval(self):
+        """Bắt đầu luồng tự động duyệt/từ chối bài chờ duyệt trong nhóm."""
+        if not self.logged_in:
+            messagebox.showwarning("Chưa đăng nhập", "Vui lòng đăng nhập Facebook trước!")
+            return
+
+        selected = [url for url, data in self.approval_selected_groups.items() if data['var'].get()]
+        if not selected:
+            messagebox.showwarning("Chưa chọn nhóm", "Vui lòng chọn ít nhất 1 nhóm để duyệt bài!")
+            return
+
+        keywords_text = ""
+        try:
+            if self.approval_keywords_box is not None:
+                keywords_text = self.approval_keywords_box.get("1.0", "end-1c").strip()
+        except Exception:
+            keywords_text = ""
+
+        blocked_keywords = [
+            k.strip().lower()
+            for k in keywords_text.splitlines()
+            if k.strip()
+        ]
+
+        if not blocked_keywords and not self.approval_auto_approve_safe.get():
+            messagebox.showwarning(
+                "Thiếu tiêu chí",
+                "Bạn chưa nhập từ khoá cũng như chưa bật tuỳ chọn phê duyệt bài an toàn.",
+            )
+            return
+
+        # Chuẩn bị thread
+        self.approval_stop_event.clear()
+
+        mode = self.approval_mode_var.get()
+        interval = max(1, int(self.approval_interval_var.get() or 1))
+
+        self.btn_start_approval.configure(state="disabled")
+        self._log(
+            f"▶️ Bắt đầu auto duyệt bài cho {len(selected)} nhóm (chế độ: {mode}, chu kỳ {interval} phút)",
+            "info",
+        )
+
+        args = (selected, blocked_keywords, mode, interval)
+        self.approval_thread = threading.Thread(target=self._group_approval_worker, args=args, daemon=True)
+        self.approval_thread.start()
+
+    def _stop_group_approval(self):
+        self.approval_stop_event.set()
+        self.btn_start_approval.configure(state="normal")
+        self._log("⏹ Đã yêu cầu dừng auto duyệt bài", "warn")
+
+    def _group_approval_worker(self, group_urls, blocked_keywords, mode, interval_minutes):
+        """Worker chạy trong thread: quét bài chờ duyệt và xử lý theo tiêu chí."""
+        try:
+            cycle = 0
+            while not self.approval_stop_event.is_set():
+                cycle += 1
+                self._log(f"🔁 [Duyệt bài] Chu kỳ #{cycle}", "info")
+                for idx, group_url in enumerate(group_urls):
+                    if self.approval_stop_event.is_set():
+                        break
+
+                    group_name = self.approval_selected_groups.get(group_url, {}).get('name', group_url)
+                    self._log(
+                        f"[{idx+1}/{len(group_urls)}] 🔍 Kiểm tra bài chờ duyệt trong nhóm: {group_name}",
+                        "info",
+                    )
+
+                    try:
+                        self._process_pending_posts_in_group(group_url, blocked_keywords)
+                    except Exception as e:
+                        self._log(f"❌ Lỗi khi duyệt bài trong nhóm {group_url}: {e}", "err")
+
+                if mode == "once":
+                    break
+
+                # Chờ cho lần kế tiếp
+                wait_seconds = max(60, int(interval_minutes) * 60)
+                for _ in range(wait_seconds // 5):
+                    if self.approval_stop_event.wait(5):
+                        break
+                if self.approval_stop_event.is_set():
+                    break
+
+        finally:
+            self._log("🔕 Đã dừng auto duyệt bài nhóm", "warn")
+            try:
+                self.after(0, lambda: self.btn_start_approval.configure(state="normal"))
+            except Exception:
+                pass
+
+    def _process_pending_posts_in_group(self, group_url, blocked_keywords):
+        """Mở trang nhóm, vào khu vực bài chờ duyệt và auto approve/deny."""
+        if not self.driver:
+            return
+
+        if self._is_action_blocked():
+            self._log("⛔ Facebook đang hạn chế thao tác, bỏ qua duyệt bài.", "err")
+            return
+
+        # Điều hướng tới trang bài chờ duyệt. Nhiều group dùng đường dẫn /pending_posts
+        try:
+            pending_url = group_url.rstrip("/") + "/pending_posts"
+            self.driver.get(pending_url)
+        except Exception:
+            self.driver.get(group_url)
+
+        time.sleep(4)
+
+        # Cuộn nhẹ để FB load danh sách
+        try:
+            for _ in range(3):
+                self.driver.execute_script("window.scrollBy(0, 800);")
+                time.sleep(1.0)
+        except Exception:
+            pass
+
+        if self._is_action_blocked():
+            self._log("⛔ Facebook đang hạn chế thao tác khi vào trang duyệt bài.", "err")
+            return
+
+        from selenium.webdriver.common.action_chains import ActionChains
+
+        posts = []
+        try:
+            posts = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
+        except Exception:
+            posts = []
+
+        if not posts:
+            self._log("ℹ Không tìm thấy bài chờ duyệt nào (hoặc giao diện khác).", "info")
+            return
+
+        processed = 0
+        approved = 0
+        rejected = 0
+
+        for post in posts:
+            if self.approval_stop_event.is_set():
+                break
+
+            if self._is_action_blocked():
+                self._log("⛔ Facebook đang hạn chế thao tác, dừng duyệt.", "err")
+                break
+
+            try:
+                text = self.driver.execute_script(
+                    "return (arguments[0].innerText || arguments[0].textContent || '').toLowerCase();",
+                    post,
+                )
+            except Exception:
+                text = ""
+
+            text = text or ""
+            is_suspicious = False
+            for kw in blocked_keywords:
+                if kw and kw in text:
+                    is_suspicious = True
+                    break
+
+            action = None  # "approve" | "reject" | None
+            if is_suspicious:
+                action = "reject"
+            elif self.approval_auto_approve_safe.get():
+                action = "approve"
+
+            if not action:
+                continue
+
+            # Tìm nút phù hợp bên trong post
+            if action == "approve":
+                clicked = self.driver.execute_script(
+                    """
+                    var root = arguments[0];
+                    if (!root) return false;
+                    function norm(s){return (s||'').toLowerCase();}
+                    var btns = root.querySelectorAll('button');
+                    for (var i=0;i<btns.length;i++){
+                        var t = norm(btns[i].innerText || btns[i].textContent);
+                        if (!t) continue;
+                        if (t.indexOf('phê duyệt')!==-1 || t.indexOf('duyệt')!==-1 || t.indexOf('approve')!==-1 || t.indexOf('chấp thuận')!==-1){
+                            try { btns[i].click(); return true; } catch(e) {}
+                        }
+                    }
+                    return false;
+                    """,
+                    post,
+                )
+                if clicked:
+                    approved += 1
+            else:
+                clicked = self.driver.execute_script(
+                    """
+                    var root = arguments[0];
+                    if (!root) return false;
+                    function norm(s){return (s||'').toLowerCase();}
+                    var btns = root.querySelectorAll('button');
+                    for (var i=0;i<btns.length;i++){
+                        var t = norm(btns[i].innerText || btns[i].textContent);
+                        if (!t) continue;
+                        if (t.indexOf('từ chối')!==-1 || t.indexOf('tu choi')!==-1 || t.indexOf('decline')!==-1 || t.indexOf('reject')!==-1){
+                            try { btns[i].click(); return true; } catch(e) {}
+                        }
+                    }
+                    return false;
+                    """,
+                    post,
+                )
+                if clicked:
+                    rejected += 1
+
+            if clicked:
+                processed += 1
+                time.sleep(1.0)
+
+        self._log(
+            f"✅ [Duyệt bài] Đã xử lý {processed} bài (phê duyệt {approved}, từ chối {rejected}) trong {group_url}",
+            "ok",
+        )
     
     def _start_commenting(self):
         """Start commenting on selected groups."""
@@ -5221,6 +5688,65 @@ class App(tk.Tk):
             
         except Exception as e:
             print(f"Apply config error: {e}")
+
+    # ── Config cho tab duyệt bài nhóm ───────────────────────────────────────
+    def _save_approval_config(self):
+        """Lưu cấu hình duyệt bài (từ khoá, chế độ, chu kỳ) ra JSON."""
+        try:
+            keywords = ""
+            try:
+                if self.approval_keywords_box is not None:
+                    keywords = self.approval_keywords_box.get("1.0", "end-1c")
+            except Exception:
+                keywords = ""
+
+            config = {
+                "keywords": keywords,
+                "mode": self.approval_mode_var.get(),
+                "interval": int(self.approval_interval_var.get() or 5),
+                "auto_approve_safe": bool(self.approval_auto_approve_safe.get()),
+            }
+
+            with open(self.approval_config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+
+            self._log(f"💾 Đã lưu cấu hình duyệt bài: {self.approval_config_file}", "ok")
+            messagebox.showinfo("Thành công", "Đã lưu cấu hình duyệt bài nhóm.")
+        except Exception as e:
+            self._log(f"❌ Lỗi lưu cấu hình duyệt bài: {e}", "err")
+
+    def _load_approval_config(self):
+        """Đọc cấu hình duyệt bài từ JSON và áp dụng vào UI sau khi build."""
+        try:
+            if not os.path.exists(self.approval_config_file):
+                return
+
+            with open(self.approval_config_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+
+            def _apply():
+                try:
+                    if self.approval_keywords_box is not None and "keywords" in config:
+                        self.approval_keywords_box.delete("1.0", "end")
+                        self.approval_keywords_box.insert("1.0", config.get("keywords", ""))
+
+                    if "mode" in config:
+                        self.approval_mode_var.set(config.get("mode", "interval"))
+
+                    if "interval" in config:
+                        self.approval_interval_var.set(int(config.get("interval", 5)))
+
+                    if "auto_approve_safe" in config:
+                        self.approval_auto_approve_safe.set(bool(config.get("auto_approve_safe", True)))
+
+                    self._log("📂 Đã load cấu hình duyệt bài nhóm", "info")
+                except Exception:
+                    pass
+
+            # Delay nhẹ để đảm bảo UI đã build xong
+            self.after(200, _apply)
+        except Exception:
+            pass
 
     # ══════════════════════════════════════════════════════════════════════════
     def _on_close(self):
