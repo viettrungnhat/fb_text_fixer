@@ -1,6 +1,6 @@
 {
   "keywords": "vay tiền",
-  "mode": "once",
-  "interval": 500,
+  "mode": "interval",
+  "interval": 120,
   "auto_approve_safe": true
 }
