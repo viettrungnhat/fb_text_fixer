@@ -5,6 +5,7 @@ Dùng Selenium để điều khiển Chrome thật (tránh bị block).
 import re
 import time
 import threading
+import datetime as dt
 import json
 import os
 import sys
@@ -63,11 +64,12 @@ class App(tk.Tk):
 
         # Profile-specific paths
         base_dir = os.path.dirname(__file__)
+        config_dir = self._get_appdata_dir()
         profile_suffix = f"_{profile_name}" if profile_name != "default" else ""
 
         # Auto-comment tab vars (bình luận vào bài trong nhóm)
-        self.config_file = os.path.join(base_dir, f"fb_comment_config{profile_suffix}.json")
-        self.comment_groups_cache_file = os.path.join(base_dir, f"fb_comment_groups_cache{profile_suffix}.json")
+        self.config_file = os.path.join(config_dir, f"fb_comment_config{profile_suffix}.json")
+        self.comment_groups_cache_file = os.path.join(config_dir, f"fb_comment_groups_cache{profile_suffix}.json")
         self.selected_groups = {}  # {group_url: {var, name}}
         self.comment_text_var = tk.StringVar(value="")
         self.comment_image_path = tk.StringVar(value="")
@@ -84,10 +86,11 @@ class App(tk.Tk):
         self._pending_selected_group_urls = set()
 
         # Group approval tab vars (duyệt bài trong nhóm)
-        self.approval_config_file = os.path.join(base_dir, f"fb_approval_config{profile_suffix}.json")
-        self.approval_groups_cache_file = os.path.join(base_dir, f"fb_approval_groups_cache{profile_suffix}.json")
+        self.approval_config_file = os.path.join(config_dir, f"fb_approval_config{profile_suffix}.json")
+        self.approval_groups_cache_file = os.path.join(config_dir, f"fb_approval_groups_cache{profile_suffix}.json")
         self.approval_selected_groups = {}  # {group_url: {var, name}}
         self._pending_selected_approval_urls = set()
+        self.managed_group_urls = set()
         self.approval_interval_var = tk.IntVar(value=5)  # phút giữa các lần quét
         self.approval_mode_var = tk.StringVar(value="interval")  # "once" hoặc "interval"
         self.approval_auto_approve_safe = tk.BooleanVar(value=True)
@@ -97,7 +100,7 @@ class App(tk.Tk):
         self.approval_group_list_frame = None
 
         # Scheduler (auto-post on personal profile)
-        self.schedule_config_file = os.path.join(base_dir, f"fb_schedule_config{profile_suffix}.json")
+        self.schedule_config_file = os.path.join(config_dir, f"fb_schedule_config{profile_suffix}.json")
         self.scheduler_thread = None
         self.scheduler_stop_event = threading.Event()
         self.scheduler_last_run_keys = set()  # prevent double-posting the same scheduled slot
@@ -118,6 +121,7 @@ class App(tk.Tk):
         self._build_ui()
         self._load_comment_config()
         self._load_approval_config()
+        self._restore_groups_cache_on_start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Sau khi UI sẵn sàng, tự động mở Chrome & kiểm tra đăng nhập Facebook một lần.
@@ -1880,6 +1884,16 @@ class App(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
     # Helpers
     # ══════════════════════════════════════════════════════════════════════════
+    def _get_appdata_dir(self):
+        """Return config/cache directory under AppData Roaming and ensure it exists."""
+        try:
+            base = os.environ.get("APPDATA") or os.path.expanduser("~")
+            path = os.path.join(base, "FBTextFixer")
+            os.makedirs(path, exist_ok=True)
+            return path
+        except Exception:
+            return os.path.dirname(__file__)
+
     def _btn(self, parent, text, cmd, bg):
         return tk.Button(parent, text=text, command=cmd,
                          font=FONT_B, bg=bg, fg=FG_LIGHT,
@@ -4120,6 +4134,12 @@ class App(tk.Tk):
                 sidebar_elem = self.driver.execute_script(find_sidebar_js)
             except:
                 pass
+
+            def _refresh_sidebar():
+                try:
+                    return self.driver.execute_script(find_sidebar_js)
+                except Exception:
+                    return None
             
             # Scroll sidebar or entire page
             if sidebar_elem:
@@ -4195,7 +4215,10 @@ class App(tk.Tk):
                             """,
                             sidebar_elem,
                         )
-                    except Exception:
+                    except Exception as e:
+                        if "stale" in str(e).lower():
+                            sidebar_elem = _refresh_sidebar()
+                        stats = None
                         stats = None
 
                     time.sleep(0.9)
@@ -4360,6 +4383,15 @@ class App(tk.Tk):
             """
             
             groups = self.driver.execute_script(groups_js, sidebar_elem, bool(managers_only)) or []
+
+            if (not managers_only) and len(groups) < 100:
+                try:
+                    fallback_groups = self.driver.execute_script(groups_js, None, False) or []
+                    if len(fallback_groups) > len(groups):
+                        groups = fallback_groups
+                        self._log(f"  ℹ Dùng danh sách nhóm mở rộng từ toàn trang: {len(groups)}", "info")
+                except Exception:
+                    pass
             
             if not groups:
                 self._log("⚠️ Không tìm thấy nhóm nào. Thử cuộn thêm hoặc kiểm tra quyền truy cập.", "warn")
@@ -4403,7 +4435,8 @@ class App(tk.Tk):
                                 variable=var,
                                 font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
                                 activebackground=BG_PANEL, activeforeground=ACCENT,
-                                selectcolor=BG_PANEL, anchor="w", wraplength=900)  # Wrap long names
+                                selectcolor=BG_PANEL, anchor="w", wraplength=900,
+                                command=self._on_comment_group_selection_changed)  # Wrap long names
             chk.pack(fill="x", padx=10, pady=1)  # Reduced padding for compact list
         
         # Log summary
@@ -4421,6 +4454,7 @@ class App(tk.Tk):
         """Select or deselect all groups."""
         for group_data in self.selected_groups.values():
             group_data['var'].set(select)
+        self._on_comment_group_selection_changed()
 
     def _fetch_groups_for_approval(self):
         """Tải nhóm RIÊNG cho tab duyệt bài (chỉ nhóm bạn quản lý)."""
@@ -4458,10 +4492,12 @@ class App(tk.Tk):
                 selectcolor=BG_PANEL,
                 anchor="w",
                 wraplength=900,
+                command=self._on_approval_group_selection_changed,
             )
             chk.pack(fill="x", padx=10, pady=1)
 
         self._log(f"  📋 Hiển thị {len(groups)} nhóm trong tab duyệt bài", "info")
+        self.managed_group_urls = set(self.approval_selected_groups.keys())
         try:
             selected_urls = [url for url, data in self.approval_selected_groups.items() if data['var'].get()]
             self._save_group_cache(self.approval_groups_cache_file, groups, selected_urls)
@@ -4472,6 +4508,25 @@ class App(tk.Tk):
     def _toggle_all_approval_groups(self, select: bool):
         for group_data in self.approval_selected_groups.values():
             group_data['var'].set(select)
+        self._on_approval_group_selection_changed()
+
+    def _on_comment_group_selection_changed(self):
+        try:
+            selected_urls = [url for url, data in self.selected_groups.items() if data['var'].get()]
+            groups = [{"name": v.get("name"), "url": k} for k, v in self.selected_groups.items()]
+            if groups:
+                self._save_group_cache(self.comment_groups_cache_file, groups, selected_urls)
+        except Exception:
+            pass
+
+    def _on_approval_group_selection_changed(self):
+        try:
+            selected_urls = [url for url, data in self.approval_selected_groups.items() if data['var'].get()]
+            groups = [{"name": v.get("name"), "url": k} for k, v in self.approval_selected_groups.items()]
+            if groups:
+                self._save_group_cache(self.approval_groups_cache_file, groups, selected_urls)
+        except Exception:
+            pass
 
     def _get_fb_user_id(self):
         """Return current FB user id via cookie (c_user), if available."""
@@ -4490,18 +4545,35 @@ class App(tk.Tk):
     def _save_group_cache(self, cache_file, groups, selected_urls):
         try:
             user_id = self._get_fb_user_id()
-            if not user_id:
-                return
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            safe_groups = []
+            for g in (groups or []):
+                try:
+                    safe_groups.append({
+                        "name": str(g.get("name", "")),
+                        "url": str(g.get("url", "")),
+                    })
+                except Exception:
+                    continue
+            safe_selected = []
+            for u in (selected_urls or []):
+                try:
+                    safe_selected.append(str(u))
+                except Exception:
+                    continue
             payload = {
-                "user_id": str(user_id),
-                "groups": groups or [],
-                "selected": selected_urls or [],
+                "user_id": str(user_id) if user_id else None,
+                "groups": safe_groups,
+                "selected": safe_selected,
                 "saved_at": dt.datetime.now().isoformat(),
             }
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                self._log(f"⚠️ Không thể lưu cache nhóm: {cache_file} ({e})", "warn")
+            except Exception:
+                pass
 
     def _load_group_cache(self, cache_file):
         try:
@@ -4522,13 +4594,20 @@ class App(tk.Tk):
             data = self._load_group_cache(self.comment_groups_cache_file)
             if not data:
                 return
-            if str(data.get("user_id")) != str(user_id):
+            if data.get("user_id") and (str(data.get("user_id")) != str(user_id)):
+                self._clear_comment_group_list()
+                self._log("⚠️ Tài khoản Facebook khác, không dùng danh sách nhóm đã lưu (Auto Comment).", "warn")
                 return
             groups = data.get("groups") or []
             selected = set(data.get("selected") or [])
             if groups:
                 self._update_group_list(groups, selected_set=selected)
                 self._log(f"📂 Đã phục hồi {len(groups)} nhóm đã quét (Auto Comment)", "info")
+                if not data.get("user_id"):
+                    try:
+                        self._save_group_cache(self.comment_groups_cache_file, groups, list(selected))
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -4542,13 +4621,62 @@ class App(tk.Tk):
             data = self._load_group_cache(self.approval_groups_cache_file)
             if not data:
                 return
-            if str(data.get("user_id")) != str(user_id):
+            if data.get("user_id") and (str(data.get("user_id")) != str(user_id)):
+                self._clear_approval_group_list()
+                self._log("⚠️ Tài khoản Facebook khác, không dùng danh sách nhóm đã lưu (Duyệt bài).", "warn")
                 return
             groups = data.get("groups") or []
             self._pending_selected_approval_urls = set(data.get("selected") or [])
             if groups:
                 self._update_approval_group_list(groups)
                 self._log(f"📂 Đã phục hồi {len(groups)} nhóm đã quét (Duyệt bài)", "info")
+                if not data.get("user_id"):
+                    try:
+                        self._save_group_cache(self.approval_groups_cache_file, groups, list(self._pending_selected_approval_urls))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _restore_groups_cache_on_start(self):
+        """Khôi phục danh sách nhóm đã quét trước đó ngay khi mở app (chưa xác thực tài khoản)."""
+        try:
+            data = self._load_group_cache(self.comment_groups_cache_file)
+            if data:
+                groups = data.get("groups") or []
+                selected = set(data.get("selected") or [])
+                if groups:
+                    self._update_group_list(groups, selected_set=selected)
+                    self._log(f"📂 Đã phục hồi {len(groups)} nhóm từ cache (Auto Comment)", "info")
+        except Exception:
+            pass
+
+        try:
+            data = self._load_group_cache(self.approval_groups_cache_file)
+            if data:
+                groups = data.get("groups") or []
+                self._pending_selected_approval_urls = set(data.get("selected") or [])
+                if groups:
+                    self._update_approval_group_list(groups)
+                    self._log(f"📂 Đã phục hồi {len(groups)} nhóm từ cache (Duyệt bài)", "info")
+        except Exception:
+            pass
+
+    def _clear_comment_group_list(self):
+        try:
+            for widget in self.group_list_frame.winfo_children():
+                widget.destroy()
+            self.selected_groups.clear()
+        except Exception:
+            pass
+
+    def _clear_approval_group_list(self):
+        try:
+            if self.approval_group_list_frame:
+                for widget in self.approval_group_list_frame.winfo_children():
+                    widget.destroy()
+            self.approval_selected_groups.clear()
+            self.managed_group_urls = set()
         except Exception:
             pass
     
@@ -6147,6 +6275,7 @@ class App(tk.Tk):
                 "mode": self.approval_mode_var.get(),
                 "interval": int(self.approval_interval_var.get() or 5),
                 "auto_approve_safe": bool(self.approval_auto_approve_safe.get()),
+                "selected_groups": [url for url, data in self.approval_selected_groups.items() if data['var'].get()],
             }
 
             with open(self.approval_config_file, "w", encoding="utf-8") as f:
@@ -6188,6 +6317,12 @@ class App(tk.Tk):
 
                     if "auto_approve_safe" in config:
                         self.approval_auto_approve_safe.set(bool(config.get("auto_approve_safe", True)))
+
+                    if "selected_groups" in config:
+                        try:
+                            self._pending_selected_approval_urls = set(config.get("selected_groups") or [])
+                        except Exception:
+                            self._pending_selected_approval_urls = set()
 
                     self._log("📂 Đã load cấu hình duyệt bài nhóm", "info")
                 except Exception:

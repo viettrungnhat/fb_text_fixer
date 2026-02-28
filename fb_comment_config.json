@@ -3,8 +3,13 @@
   "image_path": "C:/Users/Admin/Downloads/bannerfb2026.jpg",
   "mode": "sequential",
   "comment_old_posts": true,
-  "post_count": 2,
+  "post_count": 3,
   "monitor_enabled": false,
   "monitor_interval": 5,
-  "selected_groups": []
+  "selected_groups": [
+    "https://www.facebook.com/groups/vieclamtiengnhathaiduong",
+    "https://www.facebook.com/groups/vieclamtiengtrunghaiduong",
+    "https://www.facebook.com/groups/898552137172739",
+    "https://www.facebook.com/groups/705862279190813"
+  ]
 }
