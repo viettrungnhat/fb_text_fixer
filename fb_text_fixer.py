@@ -3,6 +3,7 @@ FB Text Fixer – Đăng nhập Facebook & Tự động sửa bài đăng
 Dùng Selenium để điều khiển Chrome thật (tránh bị block).
 """
 import re
+import random
 import time
 import threading
 import datetime as dt
@@ -52,8 +53,8 @@ class App(tk.Tk):
         self.profile_name = profile_name
         title_suffix = f" [{profile_name}]" if profile_name != "default" else ""
         self.title(f"🛠 FB Text Fixer – Tự động sửa bài Facebook{title_suffix}")
-        self.geometry("1200x850")  # Increased from 960x720
-        self.minsize(1000, 700)  # Increased minimum size
+        self.geometry("1400x920")
+        self.minsize(1200, 780)
         self.configure(bg=BG_DARK)
 
         self.driver = None
@@ -73,9 +74,22 @@ class App(tk.Tk):
         self.selected_groups = {}  # {group_url: {var, name}}
         self.comment_text_var = tk.StringVar(value="")
         self.comment_image_path = tk.StringVar(value="")
+        self.comment_selected_count_var = tk.StringVar(value="Đã chọn: 0 nhóm")
+        self.comment_use_templates_var = tk.BooleanVar(value=True)
+        self.comment_use_variation_var = tk.BooleanVar(value=True)
+        self.comment_images_box = None
+        self.comment_textboxes = []
         self.comment_mode_var = tk.StringVar(value="sequential")
         self.comment_old_posts_var = tk.BooleanVar(value=True)
         self.comment_post_count = tk.IntVar(value=3)  # Number of old posts to comment on
+        self.comment_delay_min_var = tk.IntVar(value=20)
+        self.comment_delay_max_var = tk.IntVar(value=60)
+        self.comment_group_rest_min_var = tk.IntVar(value=2)
+        self.comment_group_rest_max_var = tk.IntVar(value=5)
+        self.comment_session_group_min_var = tk.IntVar(value=10)
+        self.comment_session_group_max_var = tk.IntVar(value=20)
+        self.comment_session_rest_min_var = tk.IntVar(value=30)
+        self.comment_session_rest_max_var = tk.IntVar(value=60)
         self.monitor_enabled_var = tk.BooleanVar(value=False)
         self.monitor_interval_var = tk.IntVar(value=5)
         self.is_commenting = False
@@ -604,7 +618,7 @@ class App(tk.Tk):
                     return False
 
             def _top_dialog_js_prelude():
-                return """
+                return r"""
                 function _isVisible(el){
                     try {
                         if (!el) return false;
@@ -1663,34 +1677,176 @@ class App(tk.Tk):
             group_canvas.configure(scrollregion=group_canvas.bbox("all"))
         self.group_list_frame.bind("<Configure>", _on_group_frame_configure)
 
-        # ─ Comment Content ─
-        cf = tk.LabelFrame(parent, text="  Nội dung comment  ",
-                           font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
-        cf.pack(fill="x", padx=14, pady=(4, 4))  # Reduced padding
+        self.lbl_comment_selected = tk.Label(
+            gf,
+            textvariable=self.comment_selected_count_var,
+            font=FONT,
+            bg=BG_DARK,
+            fg=FG_MUTED,
+            anchor="w",
+        )
+        self.lbl_comment_selected.pack(fill="x", padx=12, pady=(0, 4))
 
-        tk.Label(cf, text="Văn bản comment:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(anchor="w", padx=14, pady=(6, 2))
-        
-        self.comment_textbox = scrolledtext.ScrolledText(cf, font=FONT_M, height=2,  # Reduced from 3 to 2 for compactness
-                                                          bg=BG_PANEL, fg=FG_LIGHT,
-                                                          insertbackground=FG_LIGHT,
-                                                          relief="flat", wrap="word")
-        self.comment_textbox.pack(fill="x", padx=14, pady=(0, 6))  # Reduced padding
-        
-        # Image upload
-        img_row = tk.Frame(cf, bg=BG_DARK)
-        img_row.pack(fill="x", padx=14, pady=(0, 6))  # Reduced padding
-        
-        tk.Label(img_row, text="Ảnh đính kèm:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left", padx=(0, 10))
+        # ─ Bottom split layout (scrollable) ─
+        bottom_wrap = tk.Frame(parent, bg=BG_DARK)
+        bottom_wrap.pack(fill="both", expand=True, padx=14, pady=(4, 6))
+
+        bottom_canvas = tk.Canvas(bottom_wrap, bg=BG_DARK, highlightthickness=0)
+        bottom_scroll = tk.Scrollbar(bottom_wrap, orient="vertical", command=bottom_canvas.yview)
+        bottom_canvas.configure(yscrollcommand=bottom_scroll.set)
+
+        bottom_scroll.pack(side="right", fill="y")
+        bottom_canvas.pack(side="left", fill="both", expand=True)
+
+        bottom = tk.Frame(bottom_canvas, bg=BG_DARK)
+        bottom_canvas.create_window((0, 0), window=bottom, anchor="nw")
+
+        def _on_bottom_configure(_e=None):
+            try:
+                bottom_canvas.configure(scrollregion=bottom_canvas.bbox("all"))
+            except Exception:
+                pass
+
+        def _on_bottom_mousewheel(e):
+            try:
+                bottom_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+
+        bottom.bind("<Configure>", _on_bottom_configure)
+        bottom_canvas.bind_all("<MouseWheel>", _on_bottom_mousewheel)
+
+        left_col = tk.Frame(bottom, bg=BG_DARK)
+        right_col = tk.Frame(bottom, bg=BG_DARK)
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        right_col.pack(side="left", fill="both", expand=True)
+
+        # Left: comment content
+        cf = tk.LabelFrame(left_col, text="  Nội dung comment  ",
+                           font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+        cf.pack(fill="both", expand=True)
+
+        tk.Label(cf, text="Nội dung comment (5 ô, dán nội dung dài vào từng ô):", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(anchor="w", padx=14, pady=(6, 2))
+
+        self.comment_textboxes = []
+        for idx in range(5):
+            row = tk.Frame(cf, bg=BG_DARK)
+            row.pack(fill="x", padx=14, pady=(0, 4))
+            tk.Label(row, text=f"Mẫu {idx+1}:", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(anchor="w")
+            box = scrolledtext.ScrolledText(
+                row,
+                font=FONT_M,
+                height=4,
+                bg=BG_PANEL,
+                fg=FG_LIGHT,
+                insertbackground=FG_LIGHT,
+                relief="flat",
+                wrap="word",
+            )
+            box.pack(fill="x", pady=(2, 2))
+            self.comment_textboxes.append(box)
+
+        # Right: images
+        imgf = tk.LabelFrame(right_col, text="  Ảnh đính kèm  ",
+                             font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+        imgf.pack(fill="x", pady=(0, 6))
+
+        img_row = tk.Frame(imgf, bg=BG_DARK)
+        img_row.pack(fill="x", padx=14, pady=(6, 6))
+
+        tk.Label(img_row, text="Ảnh:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left", padx=(0, 10))
         self._btn(img_row, "📁  Chọn ảnh", self._choose_image, "#6ab04c").pack(side="left", padx=(0, 10))
-        self.img_path_label = tk.Label(img_row, textvariable=self.comment_image_path, font=("Segoe UI", 9), 
-                                       bg=BG_DARK, fg=FG_MUTED, anchor="w")
-        self.img_path_label.pack(side="left", fill="x", expand=True)
+        self._btn(img_row, "➕  Thêm ảnh", self._append_image_to_list, "#6ab04c").pack(side="left", padx=(0, 10))
         self._btn(img_row, "✖", lambda: self.comment_image_path.set(""), "#2d2d44").pack(side="right")
 
+        self.img_path_label = tk.Label(imgf, textvariable=self.comment_image_path, font=("Segoe UI", 9),
+                                        bg=BG_DARK, fg=FG_MUTED, anchor="w")
+        self.img_path_label.pack(fill="x", padx=14, pady=(0, 6))
+
+        tk.Label(imgf, text="Danh sách ảnh (mỗi dòng 1 file):", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(anchor="w", padx=14)
+        self.comment_images_box = scrolledtext.ScrolledText(
+            imgf,
+            font=FONT_M,
+            height=4,
+            bg=BG_PANEL,
+            fg=FG_LIGHT,
+            insertbackground=FG_LIGHT,
+            relief="flat",
+            wrap="word",
+        )
+        self.comment_images_box.pack(fill="x", padx=14, pady=(2, 2))
+        self._btn(imgf, "🧹  Xóa danh sách ảnh", self._clear_image_list, "#2d2d44").pack(anchor="e", padx=14, pady=(0, 6))
+
         # ─ Execution Strategy ─
-        sf = tk.LabelFrame(parent, text="  Chiến lược thực thi  ",
+        sf = tk.LabelFrame(right_col, text="  Chiến lược thực thi  ",
                            font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
-        sf.pack(fill="x", padx=14, pady=(4, 6))  # Reduced top padding
+        sf.pack(fill="both", expand=True)
+
+        opt_row = tk.Frame(sf, bg=BG_DARK)
+        opt_row.pack(fill="x", padx=14, pady=(6, 2))
+        tk.Checkbutton(
+            opt_row,
+            text="Biến thể nhỏ",
+            variable=self.comment_use_variation_var,
+            font=FONT,
+            bg=BG_DARK,
+            fg=FG_LIGHT,
+            activebackground=BG_DARK,
+            activeforeground=ACCENT,
+            selectcolor=BG_DARK,
+        ).pack(anchor="w")
+
+        delay_row = tk.Frame(sf, bg=BG_DARK)
+        delay_row.pack(fill="x", padx=14, pady=(4, 2))
+        tk.Label(delay_row, text="Nghỉ giữa comment:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Label(delay_row, text="từ", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left", padx=(6, 4))
+        tk.Spinbox(delay_row, from_=0, to=300, textvariable=self.comment_delay_min_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
+                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
+        tk.Label(delay_row, text="đến", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left", padx=(2, 4))
+        tk.Spinbox(delay_row, from_=0, to=300, textvariable=self.comment_delay_max_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
+                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
+        tk.Label(delay_row, text="giây", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left")
+
+        group_rest_row = tk.Frame(sf, bg=BG_DARK)
+        group_rest_row.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Label(group_rest_row, text="Nghỉ sau mỗi nhóm:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Label(group_rest_row, text="từ", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left", padx=(6, 4))
+        tk.Spinbox(group_rest_row, from_=0, to=30, textvariable=self.comment_group_rest_min_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
+                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
+        tk.Label(group_rest_row, text="đến", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left", padx=(2, 4))
+        tk.Spinbox(group_rest_row, from_=0, to=30, textvariable=self.comment_group_rest_max_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
+                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
+        tk.Label(group_rest_row, text="phút", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left")
+
+        session_row = tk.Frame(sf, bg=BG_DARK)
+        session_row.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Label(session_row, text="Giới hạn nhóm/phiên:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Label(session_row, text="từ", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left", padx=(6, 4))
+        tk.Spinbox(session_row, from_=1, to=200, textvariable=self.comment_session_group_min_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
+                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
+        tk.Label(session_row, text="đến", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left", padx=(2, 4))
+        tk.Spinbox(session_row, from_=1, to=200, textvariable=self.comment_session_group_max_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
+                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
+        tk.Label(session_row, text="nhóm", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left")
+
+        session_rest_row = tk.Frame(sf, bg=BG_DARK)
+        session_rest_row.pack(fill="x", padx=14, pady=(2, 6))
+        tk.Label(session_rest_row, text="Nghỉ giữa các phiên:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Label(session_rest_row, text="từ", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left", padx=(6, 4))
+        tk.Spinbox(session_rest_row, from_=5, to=240, textvariable=self.comment_session_rest_min_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
+                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
+        tk.Label(session_rest_row, text="đến", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left", padx=(2, 4))
+        tk.Spinbox(session_rest_row, from_=5, to=240, textvariable=self.comment_session_rest_max_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT,
+                   buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(0, 6))
+        tk.Label(session_rest_row, text="phút", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left")
 
         # Post count selection (compact)
         post_count_row = tk.Frame(sf, bg=BG_DARK)
@@ -4441,6 +4597,7 @@ class App(tk.Tk):
         
         # Log summary
         self._log(f"  📋 Hiển thị {len(groups)} nhóm trong danh sách", "info")
+        self._update_comment_selected_count()
 
         # Cache scanned groups for next launch (tied to current FB account)
         try:
@@ -4516,6 +4673,15 @@ class App(tk.Tk):
             groups = [{"name": v.get("name"), "url": k} for k, v in self.selected_groups.items()]
             if groups:
                 self._save_group_cache(self.comment_groups_cache_file, groups, selected_urls)
+            self._log(f"✅ Đã chọn {len(selected_urls)} nhóm (Auto Comment)", "info")
+            self._update_comment_selected_count()
+        except Exception:
+            pass
+
+    def _update_comment_selected_count(self):
+        try:
+            cnt = len([1 for _url, data in self.selected_groups.items() if data['var'].get()])
+            self.comment_selected_count_var.set(f"Đã chọn: {cnt} nhóm")
         except Exception:
             pass
 
@@ -4525,6 +4691,7 @@ class App(tk.Tk):
             groups = [{"name": v.get("name"), "url": k} for k, v in self.approval_selected_groups.items()]
             if groups:
                 self._save_group_cache(self.approval_groups_cache_file, groups, selected_urls)
+            self._log(f"✅ Đã chọn {len(selected_urls)} nhóm (Duyệt bài)", "info")
         except Exception:
             pass
 
@@ -4534,7 +4701,7 @@ class App(tk.Tk):
             if not self.driver:
                 return None
             return self.driver.execute_script(
-                """
+                r"""
                 var m = (document.cookie || '').match(/(?:^|;\s*)c_user=(\d+)/);
                 return m ? m[1] : null;
                 """
@@ -4667,6 +4834,7 @@ class App(tk.Tk):
             for widget in self.group_list_frame.winfo_children():
                 widget.destroy()
             self.selected_groups.clear()
+            self._update_comment_selected_count()
         except Exception:
             pass
 
@@ -4689,6 +4857,29 @@ class App(tk.Tk):
         if filename:
             self.comment_image_path.set(filename)
             self._log(f"📷 Đã chọn ảnh: {os.path.basename(filename)}", "info")
+
+    def _append_image_to_list(self):
+        filenames = filedialog.askopenfilenames(
+            title="Chọn nhiều ảnh",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.gif"), ("All files", "*.*")]
+        )
+        if not filenames:
+            return
+        if self.comment_images_box is None:
+            return
+        existing = self.comment_images_box.get("1.0", "end-1c").strip()
+        lines = [line.strip() for line in existing.splitlines() if line.strip()] if existing else []
+        for f in filenames:
+            if f and f not in lines:
+                lines.append(f)
+        self.comment_images_box.delete("1.0", "end")
+        self.comment_images_box.insert("1.0", "\n".join(lines))
+        self._log(f"📷 Đã thêm {len(filenames)} ảnh vào danh sách", "info")
+
+    def _clear_image_list(self):
+        if self.comment_images_box is None:
+            return
+        self.comment_images_box.delete("1.0", "end")
 
     # ── Logic tự động duyệt bài nhóm ────────────────────────────────────────
     def _start_group_approval(self):
@@ -4805,7 +4996,7 @@ class App(tk.Tk):
         for _ in range(16):
             try:
                 probe = self.driver.execute_script(
-                    """
+                    r"""
                     function txt(el){ return (el && (el.innerText || el.textContent) || '').trim(); }
                     function norm(s){ return (s||'').toLowerCase(); }
 
@@ -5101,11 +5292,18 @@ class App(tk.Tk):
         if not selected:
             messagebox.showwarning("Chưa chọn nhóm", "Vui lòng chọn ít nhất 1 nhóm!")
             return
-        
-        comment_text = self.comment_textbox.get("1.0", "end-1c").strip()
-        if not comment_text:
-            messagebox.showwarning("Chưa có nội dung", "Vui lòng nhập nội dung comment!")
+
+        self._log(f"✅ Đã chọn {len(selected)} nhóm để comment", "info")
+
+        templates = self._get_comment_templates()
+        if not templates:
+            messagebox.showwarning("Chưa có nội dung", "Vui lòng nhập ít nhất 1 nội dung trong 5 ô mẫu!")
             return
+
+        try:
+            self._log(f"🧩 Số đoạn nội dung được nhận: {len(templates)}", "info")
+        except Exception:
+            pass
 
         if (not self.comment_old_posts_var.get()) and (not self.monitor_enabled_var.get()):
             messagebox.showwarning(
@@ -5118,22 +5316,31 @@ class App(tk.Tk):
         self.is_commenting = True
         self.btn_start_comment.configure(state="disabled")
         self._log(f"▶️ Bắt đầu comment {len(selected)} nhóm...", "info")
+
+        # Track total comments across Phase 1 + monitor
+        self._comment_session_total = 0
         
         # Clear previous tracking
         self.commented_posts_hash.clear()
         self.commented_posts_uid.clear()
         
         mode = self.comment_mode_var.get()
+        # Pass a sample text; actual content is picked per-comment.
+        sample_text = templates[0] if templates else ""
         if mode == "sequential":
-            threading.Thread(target=self._comment_sequential, args=(selected, comment_text), daemon=True).start()
+            threading.Thread(target=self._comment_sequential, args=(selected, sample_text), daemon=True).start()
         else:
-            threading.Thread(target=self._comment_parallel, args=(selected, comment_text), daemon=True).start()
+            threading.Thread(target=self._comment_parallel, args=(selected, sample_text), daemon=True).start()
     
     def _stop_commenting(self):
         """Stop commenting process."""
         self.is_commenting = False
         self.btn_start_comment.configure(state="normal")
-        self._log("⏹ Đã dừng", "warn")
+        try:
+            total = int(getattr(self, "_comment_session_total", 0) or 0)
+        except Exception:
+            total = 0
+        self._log(f"⏹ Đã dừng (tổng comment: {total})", "warn")
         
         # Stop monitor
         if self.monitor_thread:
@@ -5142,9 +5349,12 @@ class App(tk.Tk):
     
     def _comment_sequential(self, group_urls, comment_text):
         """Comment on groups sequentially (one by one)."""
-        img_path = self.comment_image_path.get()
+        img_path = self._pick_comment_image()
         post_count = self.comment_post_count.get()
         comment_old = bool(self.comment_old_posts_var.get())
+        total_commented = 0
+        session_target = self._pick_session_group_limit()
+        session_done = 0
         
         # Phase 1: Comment on old posts (optional)
         if comment_old:
@@ -5162,13 +5372,27 @@ class App(tk.Tk):
                     time.sleep(3)
 
                     # Comment on old posts (check_duplicates=False for first run)
-                    self._comment_on_group_posts(comment_text, img_path, post_count, check_duplicates=False)
+                    cmt_count = self._comment_on_group_posts(comment_text, img_path, post_count, check_duplicates=False)
+                    try:
+                        total_commented += int(cmt_count or 0)
+                        self._comment_session_total += int(cmt_count or 0)
+                    except Exception:
+                        pass
 
                     if not self.is_commenting:
                         break
 
                     self._log(f"✅ Hoàn tất: {group_name}", "ok")
-                    time.sleep(2)  # Delay between groups
+                    session_done += 1
+
+                    if not self._sleep_between_groups():
+                        break
+
+                    if session_target and session_done >= session_target and i < (len(group_urls) - 1):
+                        if not self._sleep_between_sessions():
+                            break
+                        session_done = 0
+                        session_target = self._pick_session_group_limit()
 
                 except Exception as e:
                     self._log(f"❌ Lỗi ở nhóm {group_url}: {e}", "err")
@@ -5196,7 +5420,11 @@ class App(tk.Tk):
             # No monitor, stop here
             self.is_commenting = False
             self.btn_start_comment.configure(state="normal")
-            self._log("✅ Hoàn thành!", "ok")
+            try:
+                total_all = int(getattr(self, "_comment_session_total", 0) or 0)
+            except Exception:
+                total_all = total_commented
+            self._log(f"✅ Hoàn thành! Tổng cộng đã comment: {total_all}", "ok")
     
     def _comment_parallel(self, group_urls, comment_text):
         """Comment on groups in parallel (multiple tabs)."""
@@ -5221,7 +5449,7 @@ class App(tk.Tk):
                     self._close_all_dialogs(aggressive=True)
                 except Exception:
                     pass
-                return
+                return 0
 
             # Scroll to load more posts based on post_count
             # Monitor mode should be gentle: minimal scrolling and cap comments
@@ -5230,7 +5458,7 @@ class App(tk.Tk):
                 self._log(f"  📜 Cuộn để tải {post_count} bài...", "info")
             for _ in range(scroll_times):
                 if not self.is_commenting:
-                    return
+                    return 0
                 self.driver.execute_script("window.scrollBy(0, 800);")
                 time.sleep(1.5)
             
@@ -5807,60 +6035,98 @@ class App(tk.Tk):
                                 except Exception:
                                     pass
 
-                                # Type text (preferred: execCommand insertText; fallback: send_keys)
-                                typed_ok = False
-                                try:
-                                    typed_ok = bool(self.driver.execute_script(
-                                        """
-                                        var el = arguments[0];
-                                        var text = arguments[1];
-                                        if (!el) return false;
-                                        el.focus();
-                                        try {
-                                            var sel = window.getSelection();
-                                            if (sel && sel.removeAllRanges) {
-                                                sel.removeAllRanges();
-                                                var r = document.createRange();
-                                                r.selectNodeContents(el);
-                                                r.collapse(false);
-                                                sel.addRange(r);
-                                            }
-                                        } catch(e) {}
-                                        var ok = false;
-                                        try { ok = document.execCommand('insertText', false, text); } catch(e2) {}
-                                        try {
-                                            var ev = new InputEvent('input', {bubbles:true, inputType:'insertText', data:text});
-                                            el.dispatchEvent(ev);
-                                        } catch(e3) {
-                                            try { el.dispatchEvent(new Event('input', {bubbles:true})); } catch(e4) {}
-                                        }
-                                        return ok;
-                                        """,
-                                        textarea_el,
-                                        comment_text,
-                                    ))
-                                except Exception:
-                                    typed_ok = False
+                                # Type text: paste multi-line as a single block to avoid per-line submit.
+                                comment_text = self._build_comment_text()
+                                if not comment_text:
+                                    raise Exception("Empty comment text")
 
-                                # Verify something is in the box; if not, fallback to send_keys
+                                pasted_ok = False
                                 try:
-                                    current_val = (textarea_el.text or '').strip()
-                                except Exception:
-                                    current_val = ''
+                                    import subprocess
 
-                                if (not current_val) or (len(current_val) < 2):
+                                    def _set_clipboard(txt):
+                                        try:
+                                            process = subprocess.Popen(['clip.exe'], stdin=subprocess.PIPE, shell=True)
+                                            process.communicate(txt.encode('utf-16-le'))
+                                        except Exception:
+                                            try:
+                                                import tkinter as _tk
+                                                _r = _tk.Tk()
+                                                _r.withdraw()
+                                                _r.clipboard_clear()
+                                                _r.clipboard_append(txt)
+                                                _r.update()
+                                                _r.destroy()
+                                            except Exception:
+                                                pass
+
+                                    _set_clipboard(comment_text)
+                                    actions = ActionChains(self.driver)
+                                    actions.key_down(Keys.CONTROL).send_keys('v').key_up(Keys.CONTROL).perform()
+                                    time.sleep(0.4)
                                     try:
-                                        textarea_el.send_keys(comment_text)
+                                        current_val = (textarea_el.text or '').strip()
                                     except Exception:
-                                        # Last fallback: ActionChains to active element
-                                        actions = ActionChains(self.driver)
-                                        actions.send_keys(comment_text)
-                                        actions.perform()
+                                        current_val = ''
+                                    if current_val:
+                                        pasted_ok = True
+                                except Exception:
+                                    pasted_ok = False
+
+                                if not pasted_ok:
+                                    try:
+                                        _ = self.driver.execute_script(
+                                            """
+                                            var el = arguments[0];
+                                            var text = arguments[1];
+                                            if (!el) return false;
+                                            el.focus();
+                                            try {
+                                                var sel = window.getSelection();
+                                                if (sel && sel.removeAllRanges) {
+                                                    sel.removeAllRanges();
+                                                    var r = document.createRange();
+                                                    r.selectNodeContents(el);
+                                                    r.collapse(false);
+                                                    sel.addRange(r);
+                                                }
+                                            } catch(e) {}
+                                            var ok = false;
+                                            try { ok = document.execCommand('insertText', false, text); } catch(e2) {}
+                                            try {
+                                                var ev = new InputEvent('input', {bubbles:true, inputType:'insertText', data:text});
+                                                el.dispatchEvent(ev);
+                                            } catch(e3) {
+                                                try { el.dispatchEvent(new Event('input', {bubbles:true})); } catch(e4) {}
+                                            }
+                                            return ok;
+                                            """,
+                                            textarea_el,
+                                            comment_text,
+                                        )
+                                    except Exception:
+                                        pass
+
+                                    try:
+                                        current_val = (textarea_el.text or '').strip()
+                                    except Exception:
+                                        current_val = ''
+
+                                    if (not current_val) or (len(current_val) < 2):
+                                        # Last fallback: send lines with Shift+Enter between them.
+                                        lines = comment_text.splitlines() or [comment_text]
+                                        for li, line in enumerate(lines):
+                                            if line:
+                                                textarea_el.send_keys(line)
+                                            if li < len(lines) - 1:
+                                                actions = ActionChains(self.driver)
+                                                actions.key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).perform()
 
                                 time.sleep(0.6)
 
                                 # Attach image if provided
-                                if img_path and os.path.isfile(img_path):
+                                img_choice = img_path if img_path else self._pick_comment_image()
+                                if img_choice and os.path.isfile(img_choice):
                                     try:
                                         file_input = None
                                         # Prefer file input near the editor
@@ -5906,7 +6172,7 @@ class App(tk.Tk):
 
                                         if file_input:
                                             try:
-                                                file_input.send_keys(img_path)
+                                                file_input.send_keys(img_choice)
                                                 # Wait a bit for upload/render
                                                 for _w in range(14):
                                                     time.sleep(0.5)
@@ -5985,6 +6251,22 @@ class App(tk.Tk):
                                 self._log(f"  ✅ [{commented_count}/{posts_to_process}] Đã comment", "ok")
                             else:
                                 self._log(f"  ✅ Đã comment bài mới", "ok")
+
+                            if self.is_commenting:
+                                try:
+                                    min_s = int(self.comment_delay_min_var.get())
+                                    max_s = int(self.comment_delay_max_var.get())
+                                except Exception:
+                                    min_s, max_s = 10, 20
+                                if min_s < 0:
+                                    min_s = 0
+                                if max_s < min_s:
+                                    max_s = min_s
+                                pause_seconds = random.randint(min_s, max_s) if max_s > 0 else 0
+                                if pause_seconds > 0:
+                                    if not check_duplicates:
+                                        self._log(f"  ⏳ Nghỉ {pause_seconds}s trước comment tiếp theo...", "info")
+                                    time.sleep(pause_seconds)
                     else:
                         if not check_duplicates:
                             self._log(f"  ⚠️ [{scanned_idx}] Không tìm thấy comment box", "warn")
@@ -6022,6 +6304,109 @@ class App(tk.Tk):
                 
         except Exception as e:
             self._log(f"  ❌ Lỗi khi comment: {e}", "err")
+        return commented_count
+
+    def _get_comment_templates(self):
+        templates = []
+        for box in (self.comment_textboxes or []):
+            try:
+                txt = box.get("1.0", "end-1c").strip()
+            except Exception:
+                txt = ""
+            if txt:
+                templates.append(txt)
+        return templates
+
+    def _sleep_interruptible(self, seconds):
+        try:
+            total = float(seconds)
+        except Exception:
+            total = 0
+        if total <= 0:
+            return True
+        end = time.time() + total
+        while time.time() < end:
+            if not self.is_commenting:
+                return False
+            time.sleep(0.5)
+        return True
+
+    def _pick_session_group_limit(self):
+        try:
+            min_g = int(self.comment_session_group_min_var.get())
+            max_g = int(self.comment_session_group_max_var.get())
+        except Exception:
+            min_g, max_g = 10, 20
+        if min_g <= 0 and max_g <= 0:
+            return 0
+        if min_g < 1:
+            min_g = 1
+        if max_g < min_g:
+            max_g = min_g
+        return random.randint(min_g, max_g)
+
+    def _sleep_between_groups(self):
+        try:
+            min_m = int(self.comment_group_rest_min_var.get())
+            max_m = int(self.comment_group_rest_max_var.get())
+        except Exception:
+            min_m, max_m = 2, 5
+        if min_m < 0:
+            min_m = 0
+        if max_m < min_m:
+            max_m = min_m
+        if max_m == 0:
+            return True
+        pause_min = random.randint(min_m, max_m)
+        if pause_min > 0:
+            self._log(f"  ⏳ Nghỉ {pause_min} phút trước nhóm tiếp theo...", "info")
+            return self._sleep_interruptible(pause_min * 60)
+        return True
+
+    def _sleep_between_sessions(self):
+        try:
+            min_m = int(self.comment_session_rest_min_var.get())
+            max_m = int(self.comment_session_rest_max_var.get())
+        except Exception:
+            min_m, max_m = 30, 60
+        if min_m < 0:
+            min_m = 0
+        if max_m < min_m:
+            max_m = min_m
+        pause_min = random.randint(min_m, max_m) if max_m > 0 else 0
+        if pause_min > 0:
+            self._log(f"🧘 Nghỉ {pause_min} phút giữa phiên để giảm rủi ro hạn chế...", "warn")
+            return self._sleep_interruptible(pause_min * 60)
+        return True
+
+    def _build_comment_text(self):
+        templates = self._get_comment_templates()
+        if not templates:
+            return ""
+        base = random.choice(templates).strip()
+        if not base:
+            return ""
+        if not self.comment_use_variation_var.get():
+            return base
+        suffixes = ["", ".", "!", "!!", "..."]
+        suffix = random.choice(suffixes)
+        if suffix and base.endswith((".", "!", "?")):
+            suffix = ""
+        return f"{base}{suffix}"
+
+    def _get_comment_images(self):
+        if self.comment_images_box is None:
+            return []
+        raw = self.comment_images_box.get("1.0", "end-1c")
+        items = [line.strip() for line in raw.splitlines() if line.strip()]
+        return [p for p in items if os.path.isfile(p)]
+
+    def _pick_comment_image(self):
+        img = self.comment_image_path.get().strip()
+        if img and os.path.isfile(img):
+            return img
+        pool = self._get_comment_images()
+        return random.choice(pool) if pool else ""
     
     def _start_monitor(self):
         """Start monitoring for new posts."""
@@ -6140,7 +6525,7 @@ class App(tk.Tk):
                 
                 # Get selected groups
                 selected = [url for url, data in self.selected_groups.items() if data['var'].get()]
-                comment_text = self.comment_textbox.get("1.0", "end-1c").strip()
+                comment_text = self._build_comment_text()
                 monitor_cap = max(1, int(self.comment_post_count.get() or 1))
                 
                 # Check each group for new posts
@@ -6161,8 +6546,12 @@ class App(tk.Tk):
                     
                     # Comment on new posts only (check_duplicates=True)
                     # Use smaller count for monitoring (just check recent posts)
-                    self._comment_on_group_posts(comment_text, self.comment_image_path.get(), 
+                    cmt_count = self._comment_on_group_posts(comment_text, self._pick_comment_image(), 
                                                  post_count=monitor_cap, check_duplicates=True)
+                    try:
+                        self._comment_session_total += int(cmt_count or 0)
+                    except Exception:
+                        pass
                 
                 self._log(f"💤 [Monitor] Sleep {interval}s...", "info")
                 if self.monitor_stop_event.wait(interval):
@@ -6173,7 +6562,11 @@ class App(tk.Tk):
                 if self.monitor_stop_event.wait(60):
                     break
         
-        self._log("🔕 [Monitor] Stopped", "warn")
+        try:
+            total_all = int(getattr(self, "_comment_session_total", 0) or 0)
+        except Exception:
+            total_all = 0
+        self._log(f"🔕 [Monitor] Stopped (tổng comment: {total_all})", "warn")
         self.is_commenting = False
         self.btn_start_comment.configure(state="normal")
     
@@ -6181,11 +6574,24 @@ class App(tk.Tk):
         """Save comment configuration to JSON."""
         try:
             config = {
-                "comment_text": self.comment_textbox.get("1.0", "end-1c").strip(),
+                "comment_texts": [
+                    box.get("1.0", "end-1c").strip() for box in (self.comment_textboxes or [])
+                ],
                 "image_path": self.comment_image_path.get(),
+                "image_list": self.comment_images_box.get("1.0", "end-1c").strip() if self.comment_images_box else "",
+                "use_templates": bool(self.comment_use_templates_var.get()),
+                "use_variation": bool(self.comment_use_variation_var.get()),
                 "mode": self.comment_mode_var.get(),
                 "comment_old_posts": self.comment_old_posts_var.get(),
                 "post_count": self.comment_post_count.get(),
+                "comment_delay_min": self.comment_delay_min_var.get(),
+                "comment_delay_max": self.comment_delay_max_var.get(),
+                "comment_group_rest_min": self.comment_group_rest_min_var.get(),
+                "comment_group_rest_max": self.comment_group_rest_max_var.get(),
+                "comment_session_group_min": self.comment_session_group_min_var.get(),
+                "comment_session_group_max": self.comment_session_group_max_var.get(),
+                "comment_session_rest_min": self.comment_session_rest_min_var.get(),
+                "comment_session_rest_max": self.comment_session_rest_max_var.get(),
                 "monitor_enabled": self.monitor_enabled_var.get(),
                 "monitor_interval": self.monitor_interval_var.get(),
                 "selected_groups": [url for url, data in self.selected_groups.items() if data['var'].get()]
@@ -6226,12 +6632,30 @@ class App(tk.Tk):
     def _apply_loaded_config(self, config):
         """Apply loaded config to UI."""
         try:
-            if 'comment_text' in config:
-                self.comment_textbox.delete("1.0", "end")
-                self.comment_textbox.insert("1.0", config['comment_text'])
+            if self.comment_textboxes:
+                texts = config.get("comment_texts") if isinstance(config, dict) else None
+                if isinstance(texts, list) and texts:
+                    for idx, box in enumerate(self.comment_textboxes):
+                        box.delete("1.0", "end")
+                        if idx < len(texts):
+                            box.insert("1.0", texts[idx])
+                elif 'comment_text' in config:
+                    # Backward compatibility: put old single text into the first box.
+                    self.comment_textboxes[0].delete("1.0", "end")
+                    self.comment_textboxes[0].insert("1.0", config['comment_text'])
             
             if 'image_path' in config:
                 self.comment_image_path.set(config['image_path'])
+
+            if self.comment_images_box is not None and 'image_list' in config:
+                self.comment_images_box.delete("1.0", "end")
+                self.comment_images_box.insert("1.0", config.get('image_list') or "")
+
+            if 'use_templates' in config:
+                self.comment_use_templates_var.set(bool(config['use_templates']))
+
+            if 'use_variation' in config:
+                self.comment_use_variation_var.set(bool(config['use_variation']))
             
             if 'mode' in config:
                 self.comment_mode_var.set(config['mode'])
@@ -6241,6 +6665,30 @@ class App(tk.Tk):
             
             if 'post_count' in config:
                 self.comment_post_count.set(config['post_count'])
+
+            if 'comment_delay_min' in config:
+                self.comment_delay_min_var.set(config['comment_delay_min'])
+
+            if 'comment_delay_max' in config:
+                self.comment_delay_max_var.set(config['comment_delay_max'])
+
+            if 'comment_group_rest_min' in config:
+                self.comment_group_rest_min_var.set(config['comment_group_rest_min'])
+
+            if 'comment_group_rest_max' in config:
+                self.comment_group_rest_max_var.set(config['comment_group_rest_max'])
+
+            if 'comment_session_group_min' in config:
+                self.comment_session_group_min_var.set(config['comment_session_group_min'])
+
+            if 'comment_session_group_max' in config:
+                self.comment_session_group_max_var.set(config['comment_session_group_max'])
+
+            if 'comment_session_rest_min' in config:
+                self.comment_session_rest_min_var.set(config['comment_session_rest_min'])
+
+            if 'comment_session_rest_max' in config:
+                self.comment_session_rest_max_var.set(config['comment_session_rest_max'])
             
             if 'monitor_enabled' in config:
                 self.monitor_enabled_var.set(config['monitor_enabled'])
@@ -6253,6 +6701,8 @@ class App(tk.Tk):
                     self._pending_selected_group_urls = set(config.get('selected_groups') or [])
                 except Exception:
                     self._pending_selected_group_urls = set()
+
+            self._update_comment_selected_count()
             
             self._log("📂 Đã load cấu hình", "info")
             
