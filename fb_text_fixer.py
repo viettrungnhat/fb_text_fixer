@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import argparse
+import unicodedata
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 
@@ -52,7 +53,7 @@ class App(tk.Tk):
         super().__init__()
         self.profile_name = profile_name
         title_suffix = f" [{profile_name}]" if profile_name != "default" else ""
-        self.title(f"🛠 FB Text Fixer – Tự động sửa bài Facebook{title_suffix}")
+        self.title(f"🛠 FB Text Fixer – Tự động sửa bài Facebook- Đa Ngôn Ngữ Bảo Ngọc 0916385682-0986183806{title_suffix}")
         self.geometry("1400x920")
         self.minsize(1200, 780)
         self.configure(bg=BG_DARK)
@@ -72,6 +73,9 @@ class App(tk.Tk):
         self.config_file = os.path.join(config_dir, f"fb_comment_config{profile_suffix}.json")
         self.comment_groups_cache_file = os.path.join(config_dir, f"fb_comment_groups_cache{profile_suffix}.json")
         self.selected_groups = {}  # {group_url: {var, name}}
+        self.comment_groups_all = []
+        self.comment_selected_urls = set()
+        self.comment_group_search_var = tk.StringVar(value="")
         self.comment_text_var = tk.StringVar(value="")
         self.comment_image_path = tk.StringVar(value="")
         self.comment_selected_count_var = tk.StringVar(value="Đã chọn: 0 nhóm")
@@ -98,6 +102,47 @@ class App(tk.Tk):
         self.commented_posts_hash = set()  # Track commented posts by text hash to avoid duplicates
         self.commented_posts_uid = set()   # Track commented posts by permalink/story id (more reliable)
         self._pending_selected_group_urls = set()
+        self.comment_group_text_only = set()
+
+        # Group auto-post tab vars (đăng bài trong nhóm)
+        self.group_post_config_file = os.path.join(config_dir, f"fb_group_post_config{profile_suffix}.json")
+        self.group_post_groups_cache_file = os.path.join(config_dir, f"fb_group_post_groups_cache{profile_suffix}.json")
+        self.group_post_selected_groups = {}  # {group_url: {var, name}}
+        self.group_post_groups_all = []
+        self.group_post_selected_urls = set()
+        self.group_post_search_var = tk.StringVar(value="")
+        self.group_post_selected_count_var = tk.StringVar(value="Đã chọn: 0 nhóm")
+        self.group_post_mode_var = tk.StringVar(value="interval")  # interval | schedule
+        self.group_post_template_mode_var = tk.StringVar(value="sequential")  # sequential | random
+        self.group_post_skip_pending_var = tk.BooleanVar(value=False)
+        self.group_post_interval_min_var = tk.IntVar(value=60)
+        self.group_post_interval_max_var = tk.IntVar(value=120)
+        self.group_post_group_rest_min_var = tk.IntVar(value=2)
+        self.group_post_group_rest_max_var = tk.IntVar(value=5)
+        self.group_post_session_group_min_var = tk.IntVar(value=10)
+        self.group_post_session_group_max_var = tk.IntVar(value=20)
+        self.group_post_session_rest_min_var = tk.IntVar(value=30)
+        self.group_post_session_rest_max_var = tk.IntVar(value=60)
+        self.group_post_daily_limit_var = tk.IntVar(value=1)
+        self.group_post_thread = None
+        self.group_post_stop_event = threading.Event()
+        self.group_post_schedule_thread = None
+        self.group_post_schedule_stop_event = threading.Event()
+        self.group_post_last_run_keys = set()
+        self.group_post_daily_counts = {}
+        self.group_post_pending_required = {}
+
+        # 3 post slots for group posting (used by interval and schedule)
+        self.group_post_slots = []
+        for _i in range(3):
+            self.group_post_slots.append({
+                "enabled": tk.BooleanVar(value=False),
+                "mode": tk.StringVar(value="daily"),
+                "times": tk.StringVar(value="08:00"),
+                "weekday": tk.StringVar(value="Mon"),
+                "image": tk.StringVar(value=""),
+                "text_widget": None,
+            })
 
         # Group approval tab vars (duyệt bài trong nhóm)
         self.approval_config_file = os.path.join(config_dir, f"fb_approval_config{profile_suffix}.json")
@@ -172,11 +217,13 @@ class App(tk.Tk):
         tab2 = tk.Frame(nb, bg=BG_DARK); nb.add(tab2, text="💬  Auto Comment Nhóm")
         tab3 = tk.Frame(nb, bg=BG_DARK); nb.add(tab3, text="🗓️  Đăng bài theo lịch")
         tab4 = tk.Frame(nb, bg=BG_DARK); nb.add(tab4, text="✅  Duyệt bài nhóm")
+        tab5 = tk.Frame(nb, bg=BG_DARK); nb.add(tab5, text="🧾  Auto đăng bài nhóm")
 
         self._build_tab_auto(tab1)
         self._build_tab_comment(tab2)
         self._build_tab_scheduler(tab3)
         self._build_tab_group_approval(tab4)
+        self._build_tab_group_post(tab5)
 
         # Status bar
         self.status_var = tk.StringVar(value="Sẵn sàng.")
@@ -207,6 +254,7 @@ class App(tk.Tk):
         self.btn_start_schedule.pack(side="left", padx=(0, 6))
         self.btn_stop_schedule = self._btn(btns, "⏹  Dừng", self._stop_scheduler, "#e74c3c")
         self.btn_stop_schedule.pack(side="left")
+        self._set_run_buttons(self.btn_start_schedule, self.btn_stop_schedule, False, "#1f6feb", "#e74c3c")
 
         tk.Label(
             wrap,
@@ -241,6 +289,39 @@ class App(tk.Tk):
             ("Mon", "Thứ 2"), ("Tue", "Thứ 3"), ("Wed", "Thứ 4"),
             ("Thu", "Thứ 5"), ("Fri", "Thứ 6"), ("Sat", "Thứ 7"), ("Sun", "Chủ nhật")
         ]
+
+        def _adjust_time(var, delta):
+            """Adjust the first HH:MM in the times string by delta minutes."""
+            raw = var.get().strip()
+            if not raw:
+                var.set("08:00")
+                return
+            parts = [p.strip() for p in raw.split(",")]
+            if parts:
+                first = parts[0]
+                try:
+                    hh, mm = first.split(":")
+                    total = int(hh) * 60 + int(mm) + delta
+                    total = max(0, min(23 * 60 + 59, total))
+                    parts[0] = f"{total // 60:02d}:{total % 60:02d}"
+                    var.set(", ".join(parts))
+                except Exception:
+                    pass
+
+        def _make_adjust_cmd(var, delta, entry_widget):
+            def _cmd():
+                try:
+                    if entry_widget:
+                        entry_widget.focus_set()
+                except Exception:
+                    pass
+                _adjust_time(var, delta)
+                try:
+                    if entry_widget:
+                        entry_widget.update_idletasks()
+                except Exception:
+                    pass
+            return _cmd
 
         def _weekday_label(code):
             for c, lab in weekday_options:
@@ -387,6 +468,314 @@ class App(tk.Tk):
         # Load persisted schedule config
         self._load_schedule_config()
 
+    # ── Tab 5: Auto đăng bài nhóm ───────────────────────────────────────────
+    def _build_tab_group_post(self, parent):
+        top_control = tk.Frame(parent, bg=BG_DARK)
+        top_control.pack(fill="x", padx=14, pady=(10, 6))
+
+        left_btns = tk.Frame(top_control, bg=BG_DARK)
+        left_btns.pack(side="left")
+        self._btn(left_btns, "🔄  Tải nhóm", self._fetch_groups, ACCENT).pack(side="left", padx=(0, 6))
+        self._btn(left_btns, "🔎  Quét kiểm duyệt", self._scan_group_post_pending_for_groups, "#6ab04c").pack(side="left", padx=(0, 6))
+        self._btn(left_btns, "☑️  Chọn tất cả", lambda: self._toggle_all_group_post(True), "#6ab04c").pack(side="left", padx=(0, 6))
+        self._btn(left_btns, "☐  Bỏ chọn", lambda: self._toggle_all_group_post(False), "#2d2d44").pack(side="left")
+
+        right_btns = tk.Frame(top_control, bg=BG_DARK)
+        right_btns.pack(side="right")
+        self.btn_start_group_post = self._btn(right_btns, "▶️  Bắt đầu", self._start_group_posting, ACCENT)
+        self.btn_start_group_post.pack(side="left", padx=(0, 6))
+        self.btn_stop_group_post = self._btn(right_btns, "⏹  Dừng", self._stop_group_posting, "#e74c3c")
+        self.btn_stop_group_post.pack(side="left", padx=(0, 6))
+        self._btn(right_btns, "💾  Lưu", self._save_group_post_config, "#6ab04c").pack(side="left")
+        self._set_run_buttons(self.btn_start_group_post, self.btn_stop_group_post, False, ACCENT, "#e74c3c")
+
+        gf = tk.LabelFrame(parent, text="  Chọn nhóm Facebook (dùng lại danh sách Auto Comment)  ",
+                           font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+        gf.pack(fill="x", padx=14, pady=(4, 6))
+
+        search_row = tk.Frame(gf, bg=BG_DARK)
+        search_row.pack(fill="x", padx=10, pady=(6, 4))
+        tk.Label(search_row, text="Tìm nhanh:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        search_entry = tk.Entry(
+            search_row,
+            textvariable=self.group_post_search_var,
+            font=FONT,
+            bg=BG_PANEL,
+            fg=FG_LIGHT,
+            relief="flat",
+        )
+        search_entry.pack(side="left", padx=(8, 6), fill="x", expand=True)
+        tk.Button(
+            search_row,
+            text="Xoá",
+            font=FONT_B,
+            bg=BG_PANEL,
+            fg=FG_LIGHT,
+            activebackground=BG_CARD,
+            activeforeground=FG_LIGHT,
+            relief="flat",
+            cursor="hand2",
+            command=lambda: self.group_post_search_var.set(""),
+        ).pack(side="left")
+
+        group_canvas_frame = tk.Frame(gf, bg=BG_DARK)
+        group_canvas_frame.pack(fill="x", padx=10, pady=(4, 8))
+        group_canvas = tk.Canvas(group_canvas_frame, bg=BG_PANEL, highlightthickness=0, height=200)
+        group_scrollbar = tk.Scrollbar(group_canvas_frame, orient="vertical", command=group_canvas.yview)
+        self.group_post_list_frame = tk.Frame(group_canvas, bg=BG_PANEL)
+
+        group_canvas.create_window((0, 0), window=self.group_post_list_frame, anchor="nw")
+        group_canvas.configure(yscrollcommand=group_scrollbar.set)
+        group_canvas.pack(side="left", fill="both", expand=True)
+        group_scrollbar.pack(side="right", fill="y")
+
+        def _on_group_post_frame_configure(_event=None):
+            group_canvas.configure(scrollregion=group_canvas.bbox("all"))
+        self.group_post_list_frame.bind("<Configure>", _on_group_post_frame_configure)
+
+        try:
+            self.group_post_search_var.trace_add("write", lambda *_: self._apply_group_post_filter())
+        except Exception:
+            pass
+
+        tk.Label(
+            gf,
+            textvariable=self.group_post_selected_count_var,
+            font=FONT,
+            bg=BG_DARK,
+            fg=FG_MUTED,
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 4))
+
+        body = tk.Frame(parent, bg=BG_DARK)
+        body.pack(fill="both", expand=True, padx=14, pady=(4, 6))
+
+        left_col = tk.Frame(body, bg=BG_DARK)
+        right_col = tk.Frame(body, bg=BG_DARK)
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        right_col.pack(side="left", fill="both", expand=True)
+
+        # Left: content slots (scrollable)
+        slot_canvas = tk.Canvas(left_col, bg=BG_DARK, highlightthickness=0)
+        slot_scroll = tk.Scrollbar(left_col, orient="vertical", command=slot_canvas.yview)
+        slot_canvas.configure(yscrollcommand=slot_scroll.set)
+        slot_scroll.pack(side="right", fill="y")
+        slot_canvas.pack(side="left", fill="both", expand=True)
+
+        cf = tk.LabelFrame(slot_canvas, text="  Nội dung đăng (3 mẫu)  ",
+                           font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+        slot_canvas.create_window((0, 0), window=cf, anchor="nw")
+
+        def _on_cf_configure(_e=None):
+            try:
+                slot_canvas.configure(scrollregion=slot_canvas.bbox("all"))
+            except Exception:
+                pass
+        cf.bind("<Configure>", _on_cf_configure)
+
+        def _adjust_time(var, delta):
+            """Adjust the first HH:MM in the times string by delta minutes."""
+            raw = var.get().strip()
+            if not raw:
+                var.set("08:00")
+                return
+            parts = [p.strip() for p in raw.split(",")]
+            if parts:
+                first = parts[0]
+                try:
+                    hh, mm = first.split(":")
+                    total = int(hh) * 60 + int(mm) + delta
+                    total = max(0, min(23 * 60 + 59, total))
+                    parts[0] = f"{total // 60:02d}:{total % 60:02d}"
+                    var.set(", ".join(parts))
+                except Exception:
+                    pass
+
+        def _make_adjust_cmd(var, delta, entry_widget):
+            def _cmd():
+                try:
+                    if entry_widget:
+                        entry_widget.focus_set()
+                except Exception:
+                    pass
+                _adjust_time(var, delta)
+                try:
+                    if entry_widget:
+                        entry_widget.update_idletasks()
+                except Exception:
+                    pass
+            return _cmd
+
+        weekday_options = [
+            ("Mon", "Thứ 2"), ("Tue", "Thứ 3"), ("Wed", "Thứ 4"),
+            ("Thu", "Thứ 5"), ("Fri", "Thứ 6"), ("Sat", "Thứ 7"), ("Sun", "Chủ nhật")
+        ]
+
+        for i in range(3):
+            slot = self.group_post_slots[i]
+            lf = tk.LabelFrame(cf, text=f"  Mẫu {i+1}  ", font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+            lf.pack(fill="x", padx=10, pady=(6, 6))
+
+            top = tk.Frame(lf, bg=BG_DARK)
+            top.pack(fill="x", padx=8, pady=(6, 4))
+            tk.Checkbutton(
+                top,
+                text="Bật mẫu này",
+                variable=slot["enabled"],
+                font=FONT,
+                bg=BG_DARK,
+                fg=FG_LIGHT,
+                activebackground=BG_DARK,
+                activeforeground=FG_LIGHT,
+                selectcolor=BG_DARK,
+            ).pack(side="left")
+
+            tk.Label(top, text="Loại lịch:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left", padx=(10, 4))
+            ttk.Combobox(top, values=["daily", "weekly"], textvariable=slot["mode"], width=8, state="readonly").pack(side="left")
+            tk.Label(top, text="Giờ đăng:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left", padx=(10, 4))
+            time_entry = tk.Entry(top, textvariable=slot["times"], width=22, font=FONT, bg=BG_PANEL, fg=FG_LIGHT, relief="flat")
+            time_entry.pack(side="left")
+
+            hour_frame = tk.Frame(top, bg=BG_DARK)
+            hour_frame.pack(side="left", padx=(4, 0))
+            tk.Label(hour_frame, text="Giờ", font=("Segoe UI", 7), bg=BG_DARK, fg=FG_MUTED).pack(side="top")
+            tk.Button(
+                hour_frame, text="▲", font=("Segoe UI", 8), width=2,
+                bg=BG_PANEL, fg=FG_LIGHT, activebackground="#2a2a4e", activeforeground=FG_LIGHT,
+                relief="flat", cursor="hand2", bd=0,
+                command=_make_adjust_cmd(slot["times"], 60, time_entry),
+            ).pack(side="top", pady=0)
+            tk.Button(
+                hour_frame, text="▼", font=("Segoe UI", 8), width=2,
+                bg=BG_PANEL, fg=FG_LIGHT, activebackground="#2a2a4e", activeforeground=FG_LIGHT,
+                relief="flat", cursor="hand2", bd=0,
+                command=_make_adjust_cmd(slot["times"], -60, time_entry),
+            ).pack(side="top", pady=0)
+
+            min_frame = tk.Frame(top, bg=BG_DARK)
+            min_frame.pack(side="left", padx=(2, 0))
+            tk.Label(min_frame, text="Phút", font=("Segoe UI", 7), bg=BG_DARK, fg=FG_MUTED).pack(side="top")
+            tk.Button(
+                min_frame, text="▲", font=("Segoe UI", 8), width=2,
+                bg=BG_PANEL, fg=FG_LIGHT, activebackground="#2a2a4e", activeforeground=FG_LIGHT,
+                relief="flat", cursor="hand2", bd=0,
+                command=_make_adjust_cmd(slot["times"], 1, time_entry),
+            ).pack(side="top", pady=0)
+            tk.Button(
+                min_frame, text="▼", font=("Segoe UI", 8), width=2,
+                bg=BG_PANEL, fg=FG_LIGHT, activebackground="#2a2a4e", activeforeground=FG_LIGHT,
+                relief="flat", cursor="hand2", bd=0,
+                command=_make_adjust_cmd(slot["times"], -1, time_entry),
+            ).pack(side="top", pady=0)
+
+            tk.Label(top, text="Thứ:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left", padx=(10, 4))
+            ttk.Combobox(top, values=[c for c, _lab in weekday_options], textvariable=slot["weekday"], width=5, state="readonly").pack(side="left")
+
+            img_row = tk.Frame(lf, bg=BG_DARK)
+            img_row.pack(fill="x", padx=8, pady=(2, 4))
+            tk.Label(img_row, text="Ảnh (tuỳ chọn):", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+            tk.Entry(img_row, textvariable=slot["image"], font=FONT, width=50, bg=BG_PANEL, fg=FG_LIGHT, relief="flat").pack(side="left", padx=(6, 6), fill="x", expand=True)
+            tk.Button(
+                img_row,
+                text="Chọn ảnh",
+                command=lambda idx=i: self._choose_group_post_image(idx),
+                font=FONT_B,
+                bg=BG_PANEL,
+                fg=FG_LIGHT,
+                activebackground=BG_CARD,
+                activeforeground=FG_LIGHT,
+                relief="flat",
+                cursor="hand2",
+                padx=10,
+                pady=2,
+            ).pack(side="left")
+
+            txt = tk.Text(lf, height=4, font=FONT, bg=BG_PANEL, fg=FG_LIGHT, insertbackground=FG_LIGHT,
+                          relief="flat", wrap="word")
+            txt.pack(fill="x", padx=8, pady=(0, 6))
+            slot["text_widget"] = txt
+
+        # Right: settings
+        sf = tk.LabelFrame(right_col, text="  Cài đặt chạy  ", font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
+        sf.pack(fill="both", expand=True)
+
+        mode_row = tk.Frame(sf, bg=BG_DARK)
+        mode_row.pack(fill="x", padx=14, pady=(6, 4))
+        tk.Label(mode_row, text="Chế độ:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Radiobutton(mode_row, text="Chu kỳ", variable=self.group_post_mode_var, value="interval",
+                       font=FONT, bg=BG_DARK, fg=FG_LIGHT, selectcolor=BG_DARK).pack(side="left", padx=(8, 8))
+        tk.Radiobutton(mode_row, text="Theo lịch", variable=self.group_post_mode_var, value="schedule",
+                       font=FONT, bg=BG_DARK, fg=FG_LIGHT, selectcolor=BG_DARK).pack(side="left")
+
+        template_row = tk.Frame(sf, bg=BG_DARK)
+        template_row.pack(fill="x", padx=14, pady=(4, 4))
+        tk.Label(template_row, text="Chọn mẫu:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        ttk.Combobox(template_row, values=["sequential", "random"], textvariable=self.group_post_template_mode_var,
+                     width=12, state="readonly").pack(side="left", padx=(8, 6))
+        tk.Label(template_row, text="(chu kỳ dùng mẫu bật)", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left")
+
+        skip_row = tk.Frame(sf, bg=BG_DARK)
+        skip_row.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Checkbutton(
+            skip_row,
+            text="Bỏ qua nhóm cần kiểm duyệt",
+            variable=self.group_post_skip_pending_var,
+            font=FONT,
+            bg=BG_DARK,
+            fg=FG_LIGHT,
+            activebackground=BG_DARK,
+            activeforeground=ACCENT,
+            selectcolor=BG_DARK,
+        ).pack(anchor="w")
+
+        interval_row = tk.Frame(sf, bg=BG_DARK)
+        interval_row.pack(fill="x", padx=14, pady=(4, 2))
+        tk.Label(interval_row, text="Chu kỳ quét:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(interval_row, from_=1, to=720, textvariable=self.group_post_interval_min_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(6, 4))
+        tk.Label(interval_row, text="đến", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(interval_row, from_=1, to=720, textvariable=self.group_post_interval_max_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(4, 4))
+        tk.Label(interval_row, text="phút", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+
+        rest_row = tk.Frame(sf, bg=BG_DARK)
+        rest_row.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Label(rest_row, text="Nghỉ sau mỗi nhóm:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(rest_row, from_=0, to=120, textvariable=self.group_post_group_rest_min_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(6, 4))
+        tk.Label(rest_row, text="đến", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(rest_row, from_=0, to=120, textvariable=self.group_post_group_rest_max_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(4, 4))
+        tk.Label(rest_row, text="phút", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+
+        session_row = tk.Frame(sf, bg=BG_DARK)
+        session_row.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Label(session_row, text="Giới hạn nhóm/phiên:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(session_row, from_=1, to=200, textvariable=self.group_post_session_group_min_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(6, 4))
+        tk.Label(session_row, text="đến", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(session_row, from_=1, to=200, textvariable=self.group_post_session_group_max_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(4, 4))
+        tk.Label(session_row, text="nhóm", font=FONT, bg=BG_DARK, fg=FG_MUTED).pack(side="left")
+
+        session_rest_row = tk.Frame(sf, bg=BG_DARK)
+        session_rest_row.pack(fill="x", padx=14, pady=(2, 2))
+        tk.Label(session_rest_row, text="Nghỉ giữa phiên:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(session_rest_row, from_=1, to=240, textvariable=self.group_post_session_rest_min_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(6, 4))
+        tk.Label(session_rest_row, text="đến", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(session_rest_row, from_=1, to=240, textvariable=self.group_post_session_rest_max_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(4, 4))
+        tk.Label(session_rest_row, text="phút", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+
+        limit_row = tk.Frame(sf, bg=BG_DARK)
+        limit_row.pack(fill="x", padx=14, pady=(2, 6))
+        tk.Label(limit_row, text="Giới hạn bài/nhóm/ngày:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        tk.Spinbox(limit_row, from_=1, to=20, textvariable=self.group_post_daily_limit_var, width=5,
+                   font=FONT, bg=BG_PANEL, fg=FG_LIGHT, buttonbackground=BG_CARD, relief="flat").pack(side="left", padx=(6, 4))
+
+        self._load_group_post_config()
+
     def _choose_schedule_image(self, idx):
         filename = filedialog.askopenfilename(
             title="Chọn ảnh",
@@ -481,12 +870,14 @@ class App(tk.Tk):
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             return
 
+        self._set_run_buttons(self.btn_start_schedule, self.btn_stop_schedule, True, "#1f6feb", "#e74c3c")
         self._log("🗓️ [Lịch] Bắt đầu chạy lịch đăng bài...", "info")
         self.scheduler_thread = threading.Thread(target=self._scheduler_worker, daemon=True)
         self.scheduler_thread.start()
 
     def _stop_scheduler(self):
         self.scheduler_stop_event.set()
+        self._set_run_buttons(self.btn_start_schedule, self.btn_stop_schedule, False, "#1f6feb", "#e74c3c")
         self._log("⏹️ [Lịch] Đã dừng", "warn")
 
     def _scheduler_worker(self):
@@ -524,82 +915,87 @@ class App(tk.Tk):
 
         weekday_map = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
 
-        while not self.scheduler_stop_event.is_set():
-            try:
-                if self._is_action_blocked():
-                    self._log("⛔ [Lịch] Facebook đang hạn chế thao tác. Tự dừng để tránh bị chặn thêm.", "err")
-                    try:
-                        self._close_all_dialogs(aggressive=True)
-                    except Exception:
-                        pass
-                    self.scheduler_stop_event.set()
-                    break
-
-                now = _dt.datetime.now()
-                for idx, slot in enumerate(self.schedule_slots):
-                    if self.scheduler_stop_event.is_set():
-                        break
-                    if not slot["enabled"].get():
-                        continue
-
-                    mode = slot["mode"].get()
-                    times = _parse_times_list(slot["times"].get())
-                    wd = weekday_map.get(slot["weekday"].get(), 0)
-
-                    candidates = []
-                    if mode == "weekly":
-                        if now.weekday() == wd:
-                            for (hh, mm) in times[:6]:
-                                candidates.append((now.replace(hour=hh, minute=mm, second=0, microsecond=0), f"w{hh:02d}{mm:02d}"))
-                    else:
-                        for (hh, mm) in times[:6]:
-                            candidates.append((now.replace(hour=hh, minute=mm, second=0, microsecond=0), f"d{hh:02d}{mm:02d}"))
-
-                    for target_dt, tag in candidates:
-                        # Due window: within 2 minutes after target time
-                        delta = (now - target_dt).total_seconds()
-                        if delta < 0 or delta > 120:
-                            continue
-                        run_key = f"slot{idx+1}:{target_dt.strftime('%Y%m%d')}:{tag}:{target_dt.strftime('%H%M')}"
-                        if run_key in self.scheduler_last_run_keys:
-                            continue
-
-                        # Gather content
-                        text = ""
+        try:
+            while not self.scheduler_stop_event.is_set():
+                try:
+                    if self._is_action_blocked():
+                        self._log("⛔ [Lịch] Facebook đang hạn chế thao tác. Tự dừng để tránh bị chặn thêm.", "err")
                         try:
-                            tw = slot.get("text_widget")
-                            if tw is not None:
-                                text = tw.get("1.0", "end-1c").strip()
+                            self._close_all_dialogs(aggressive=True)
                         except Exception:
-                            text = ""
+                            pass
+                        self.scheduler_stop_event.set()
+                        break
 
-                        img = slot["image"].get().strip()
-                        if (not text) and (not img):
-                            self._log(f"⚠️ [Lịch] Nội dung {idx+1} trống, bỏ qua lần đăng.", "warn")
-                            self.scheduler_last_run_keys.add(run_key)
+                    now = _dt.datetime.now()
+                    for idx, slot in enumerate(self.schedule_slots):
+                        if self.scheduler_stop_event.is_set():
+                            break
+                        if not slot["enabled"].get():
                             continue
 
-                        self._log(f"🕒 [Lịch] Đến giờ đăng nội dung {idx+1} ({mode})...", "info")
-                        ok = self._post_to_profile(text, img)
-                        self.scheduler_last_run_keys.add(run_key)
-                        if ok:
-                            self._log(f"✅ [Lịch] Đã đăng nội dung {idx+1}", "ok")
+                        mode = slot["mode"].get()
+                        times = _parse_times_list(slot["times"].get())
+                        wd = weekday_map.get(slot["weekday"].get(), 0)
+
+                        candidates = []
+                        if mode == "weekly":
+                            if now.weekday() == wd:
+                                for (hh, mm) in times[:6]:
+                                    candidates.append((now.replace(hour=hh, minute=mm, second=0, microsecond=0), f"w{hh:02d}{mm:02d}"))
                         else:
-                            self._log(f"⚠️ [Lịch] Đăng nội dung {idx+1} có thể chưa thành công", "warn")
+                            for (hh, mm) in times[:6]:
+                                candidates.append((now.replace(hour=hh, minute=mm, second=0, microsecond=0), f"d{hh:02d}{mm:02d}"))
 
-                # poll interval
-                if self.scheduler_stop_event.wait(20):
-                    break
+                        for target_dt, tag in candidates:
+                            # Due window: within 2 minutes after target time
+                            delta = (now - target_dt).total_seconds()
+                            if delta < 0 or delta > 120:
+                                continue
+                            run_key = f"slot{idx+1}:{target_dt.strftime('%Y%m%d')}:{tag}:{target_dt.strftime('%H%M')}"
+                            if run_key in self.scheduler_last_run_keys:
+                                continue
 
-            except Exception as e:
-                self._log(f"❌ [Lịch] Error: {e}", "err")
-                if self.scheduler_stop_event.wait(30):
-                    break
+                            # Gather content
+                            text = ""
+                            try:
+                                tw = slot.get("text_widget")
+                                if tw is not None:
+                                    text = tw.get("1.0", "end-1c").strip()
+                            except Exception:
+                                text = ""
 
-        self._log("🔕 [Lịch] Stopped", "warn")
+                            img = slot["image"].get().strip()
+                            if (not text) and (not img):
+                                self._log(f"⚠️ [Lịch] Nội dung {idx+1} trống, bỏ qua lần đăng.", "warn")
+                                self.scheduler_last_run_keys.add(run_key)
+                                continue
 
-    def _post_to_profile(self, text, img_path):
-        """Best-effort: open profile/page composer, fill text, attach image, click Next/Post."""
+                            self._log(f"🕒 [Lịch] Đến giờ đăng nội dung {idx+1} ({mode})...", "info")
+                            ok = self._post_to_profile(text, img, stop_event=self.scheduler_stop_event, log_tag="[Lịch]")
+                            self.scheduler_last_run_keys.add(run_key)
+                            if ok:
+                                self._log(f"✅ [Lịch] Đã đăng nội dung {idx+1}", "ok")
+                            else:
+                                self._log(f"⚠️ [Lịch] Đăng nội dung {idx+1} có thể chưa thành công", "warn")
+
+                    # poll interval
+                    if self.scheduler_stop_event.wait(20):
+                        break
+
+                except Exception as e:
+                    self._log(f"❌ [Lịch] Error: {e}", "err")
+                    if self.scheduler_stop_event.wait(30):
+                        break
+        finally:
+            self._log("🔕 [Lịch] Stopped", "warn")
+            try:
+                self.after(0, lambda: self._set_run_buttons(self.btn_start_schedule, self.btn_stop_schedule, False, "#1f6feb", "#e74c3c"))
+            except Exception:
+                pass
+
+    def _post_to_profile(self, text, img_path, target_url=None, stop_event=None, log_tag="[Lịch]"):
+        """Best-effort: open composer, fill text, attach image, click Next/Post."""
         try:
             if not self.driver:
                 return False
@@ -613,6 +1009,8 @@ class App(tk.Tk):
 
             def _stop_requested():
                 try:
+                    if stop_event is not None:
+                        return bool(stop_event.is_set())
                     return bool(self.scheduler_stop_event.is_set())
                 except Exception:
                     return False
@@ -668,13 +1066,73 @@ class App(tk.Tk):
                     time.sleep(0.25)
                 return None
 
+            def _is_composer_dialog(dlg):
+                try:
+                    return bool(self.driver.execute_script(
+                        _top_dialog_js_prelude()
+                        + """
+                        var d = arguments[0];
+                        if (!d) return false;
+                        var t = _norm(d.innerText || d.textContent || '');
+                        if (t.indexOf('tạo bài viết') !== -1 ||
+                            t.indexOf('tao bai viet') !== -1 ||
+                            t.indexOf('create post') !== -1 ||
+                            t.indexOf('thêm vào bài viết') !== -1 ||
+                            t.indexOf('them vao bai viet') !== -1 ||
+                            t.indexOf('add to your post') !== -1) return true;
+                        var eds = d.querySelectorAll('[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]');
+                        for (var i=0;i<eds.length;i++){
+                            var a = _norm(eds[i].getAttribute('aria-label') || '');
+                            var p = _norm(eds[i].getAttribute('aria-placeholder') || eds[i].getAttribute('data-placeholder') || '');
+                            var isComment = (a.indexOf('bình luận') !== -1 || a.indexOf('trả lời') !== -1 || a.indexOf('comment') !== -1 || a.indexOf('reply') !== -1 ||
+                                            p.indexOf('bình luận') !== -1 || p.indexOf('trả lời') !== -1 || p.indexOf('comment') !== -1 || p.indexOf('reply') !== -1);
+                            if (!isComment) return true;
+                        }
+                        return false;
+                        """,
+                        dlg,
+                    ))
+                except Exception:
+                    return False
+
+            def _dismiss_notification_dialogs():
+                try:
+                    return bool(self.driver.execute_script(
+                        _top_dialog_js_prelude()
+                        + """
+                        var ds = Array.from(document.querySelectorAll('[role="dialog"]')).filter(_isVisible);
+                        var closed = false;
+                        for (var i=0;i<ds.length;i++){
+                            var d = ds[i];
+                            var t = _norm(d.innerText || d.textContent || '');
+                            if (t.indexOf('thông báo') === -1 && t.indexOf('notification') === -1) continue;
+                            var btns = Array.from(d.querySelectorAll('button, [role="button"]'));
+                            for (var j=0;j<btns.length;j++){
+                                var bt = _norm(btns[j].innerText || btns[j].textContent || '');
+                                var bl = _norm(btns[j].getAttribute('aria-label') || '');
+                                if (bt === 'đóng' || bt === 'ok' || bt === 'đồng ý' || bt === 'close' || bt === 'okay' ||
+                                    bl.indexOf('đóng') !== -1 || bl.indexOf('close') !== -1) {
+                                    try { btns[j].click(); closed = true; break; } catch(e) {}
+                                }
+                            }
+                            if (closed) break;
+                        }
+                        return closed;
+                        """
+                    ))
+                except Exception:
+                    return False
+
             def _open_composer_dialog():
                 if _stop_requested() or self._is_action_blocked():
                     return None
 
-                # Go to profile (works for both personal profile and page-as-profile)
+                # Go to target URL (group) or profile (default)
                 try:
-                    self.driver.get("https://www.facebook.com/me")
+                    if target_url:
+                        self.driver.get(target_url)
+                    else:
+                        self.driver.get("https://www.facebook.com/me")
                 except Exception:
                     try:
                         self.driver.get("https://www.facebook.com/")
@@ -690,8 +1148,10 @@ class App(tk.Tk):
                     except Exception:
                         pass
                     time.sleep(0.25)
+                    if _dismiss_notification_dialogs():
+                        time.sleep(0.4)
                     dlg = _wait_top_dialog(timeout=0.01)
-                    if dlg:
+                    if dlg and _is_composer_dialog(dlg):
                         return dlg
 
                 cur_url = ""
@@ -699,7 +1159,7 @@ class App(tk.Tk):
                     cur_url = self.driver.current_url or ""
                 except Exception:
                     pass
-                self._log(f"🔍 [Lịch] URL hiện tại: {cur_url}", "info")
+                self._log(f"🔍 {log_tag} URL hiện tại: {cur_url}", "info")
 
                 # Click any visible entry point (VN/EN)
                 phrases = [
@@ -707,6 +1167,9 @@ class App(tk.Tk):
                     "thêm vào bài viết", "them vao bai viet",
                     "tạo bài viết", "tao bai viet",
                     "viết gì đó", "viet gi do",
+                    "bạn viết gì đi", "ban viet gi di",
+                    "viết bài", "viet bai",
+                    "tạo bài viết trong nhóm", "tao bai viet trong nhom",
                     "what's on your mind", "create post",
                     "write something",
                 ]
@@ -768,14 +1231,14 @@ class App(tk.Tk):
                         clicked = False
 
                     if clicked:
-                        self._log(f"🔍 [Lịch] Đã click trigger (lần {_try+1}), chờ dialog...", "info")
+                        self._log(f"🔍 {log_tag} Đã click trigger (lần {_try+1}), chờ dialog...", "info")
                         dlg = _wait_top_dialog(timeout=10)
-                        if dlg:
+                        if dlg and _is_composer_dialog(dlg):
                             return dlg
-                        self._log("🔍 [Lịch] Dialog chưa xuất hiện sau click, thử lại...", "info")
+                        self._log(f"🔍 {log_tag} Dialog chưa xuất hiện sau click, thử lại...", "info")
                     else:
                         if _try == 0:
-                            self._log("🔍 [Lịch] Không tìm thấy trigger, thử lại...", "info")
+                            self._log(f"🔍 {log_tag} Không tìm thấy trigger, thử lại...", "info")
 
                     # Strategy B (fallback): try Selenium XPath directly
                     if _try >= 2:
@@ -784,6 +1247,10 @@ class App(tk.Tk):
                             xpaths = [
                                 "//div[@role='button'][contains(., 'nghĩ gì')]",
                                 "//div[@role='button'][contains(., 'nghi gi')]",
+                                "//div[@role='button'][contains(., 'viết bài')]",
+                                "//div[@role='button'][contains(., 'viet bai')]",
+                                "//div[@role='button'][contains(., 'bạn viết')]",
+                                "//div[@role='button'][contains(., 'ban viet')]",
                                 "//span[contains(., 'nghĩ gì')]",
                                 "//span[contains(., 'nghi gi')]",
                                 "//*[@aria-label[contains(., 'Tạo bài viết')]]",
@@ -798,7 +1265,7 @@ class App(tk.Tk):
                                         try:
                                             if el.is_displayed():
                                                 el.click()
-                                                self._log(f"🔍 [Lịch] Click trigger qua XPath (lần {_try+1})", "info")
+                                                self._log(f"🔍 {log_tag} Click trigger qua XPath (lần {_try+1})", "info")
                                                 dlg = _wait_top_dialog(timeout=10)
                                                 if dlg:
                                                     return dlg
@@ -811,6 +1278,42 @@ class App(tk.Tk):
 
                     time.sleep(1.0)
                 return _wait_top_dialog(timeout=6)
+
+            def _find_inline_editor():
+                try:
+                    return self.driver.execute_script(
+                        """
+                        function _vis(el){
+                            try {
+                                if (!el) return false;
+                                var r = el.getBoundingClientRect();
+                                if (r.width < 50 || r.height < 30) return false;
+                                var st = window.getComputedStyle(el);
+                                if (st.display === 'none' || st.visibility === 'hidden') return false;
+                                if (parseFloat(st.opacity || '1') <= 0.01) return false;
+                                return true;
+                            } catch(e){ return false; }
+                        }
+                        var cands = Array.from(document.querySelectorAll('[role="textbox"], [contenteditable="true"], [contenteditable="plaintext-only"]'));
+                        for (var i=0;i<cands.length;i++){
+                            var el = cands[i];
+                            if (!_vis(el)) continue;
+                            var a = (el.getAttribute('aria-label')||'').toLowerCase();
+                            var p = (el.getAttribute('aria-placeholder')||el.getAttribute('data-placeholder')||'').toLowerCase();
+                            if (a.indexOf('bình luận') !== -1 || a.indexOf('trả lời') !== -1 || a.indexOf('comment') !== -1 || a.indexOf('reply') !== -1 ||
+                                p.indexOf('bình luận') !== -1 || p.indexOf('trả lời') !== -1 || p.indexOf('comment') !== -1 || p.indexOf('reply') !== -1) {
+                                continue;
+                            }
+                            if (a.indexOf('bạn viết') !== -1 || a.indexOf('ban viet') !== -1 || a.indexOf('write') !== -1 ||
+                                p.indexOf('bạn viết') !== -1 || p.indexOf('ban viet') !== -1 || p.indexOf('write') !== -1) {
+                                return el;
+                            }
+                        }
+                        return null;
+                        """
+                    )
+                except Exception:
+                    return None
 
             def _find_editor_in_dialog():
                 """Find the contenteditable editor – search ALL dialogs AND the entire document.
@@ -867,6 +1370,11 @@ class App(tk.Tk):
                                     var a = _norm(el.getAttribute('aria-label') || '');
                                     var ph = _norm(el.getAttribute('data-placeholder') || '');
                                     var ap = _norm(el.getAttribute('aria-placeholder') || '');
+                                    if (a.indexOf('bình luận') !== -1 || a.indexOf('trả lời') !== -1 || a.indexOf('comment') !== -1 || a.indexOf('reply') !== -1 ||
+                                        ph.indexOf('bình luận') !== -1 || ph.indexOf('trả lời') !== -1 || ph.indexOf('comment') !== -1 || ph.indexOf('reply') !== -1 ||
+                                        ap.indexOf('bình luận') !== -1 || ap.indexOf('trả lời') !== -1 || ap.indexOf('comment') !== -1 || ap.indexOf('reply') !== -1) {
+                                        continue;
+                                    }
                                     var score = area;
                                     if (
                                         a.indexOf('bạn đang nghĩ gì') !== -1 ||
@@ -1138,11 +1646,17 @@ class App(tk.Tk):
                 return False
 
             # 1) Open composer dialog
-            self._log("📝 [Lịch] Mở hộp tạo bài viết...", "info")
+            self._log(f"📝 {log_tag} Mở hộp tạo bài viết...", "info")
             dlg = _open_composer_dialog()
             if not dlg:
-                self._log("⚠️ [Lịch] Không mở được hộp tạo bài viết", "warn")
-                return False
+                inline_editor = _find_inline_editor()
+                if not inline_editor:
+                    self._log(f"⚠️ {log_tag} Không mở được hộp tạo bài viết", "warn")
+                    return False
+                try:
+                    composer_root[0] = inline_editor
+                except Exception:
+                    pass
             if self._is_action_blocked() or _stop_requested():
                 return False
 
@@ -1195,9 +1709,9 @@ class App(tk.Tk):
                                 return info.join('\\n');
                                 """
                             )
-                            self._log(f"🔍 [Lịch] Dialog DOM (try {_ed_try}):\\n{diag}", "info")
+                            self._log(f"🔍 {log_tag} Dialog DOM (try {_ed_try}):\n{diag}", "info")
                         except Exception as ex_diag:
-                            self._log(f"🔍 [Lịch] Diag error: {ex_diag}", "warn")
+                            self._log(f"🔍 {log_tag} Diag error: {ex_diag}", "warn")
 
                     # Try clicking inside dialog to activate the editor
                     if _ed_try <= 5:
@@ -1224,6 +1738,22 @@ class App(tk.Tk):
                                     try { el.scrollIntoView({block:'center'}); } catch(e){}
                                     try { el.focus(); } catch(e){}
                                     try { el.click(); } catch(e){}
+                                }
+                                // Click small trigger text like "Bạn viết gì đi..." inside dialog
+                                var phrases = ['bạn viết', 'ban viet', 'viết bài', 'viet bai', 'nghĩ gì', 'nghi gi', "what's on your mind"];
+                                var nodes = dlg.querySelectorAll('div, span, p, a, button');
+                                for (var k=0;k<nodes.length;k++){
+                                    var n = nodes[k];
+                                    var t = _norm(n.innerText || n.textContent);
+                                    var a = _norm(n.getAttribute('aria-label') || '');
+                                    var hit = false;
+                                    for (var p=0;p<phrases.length;p++){
+                                        var ph = _norm(phrases[p]);
+                                        if ((t && t.indexOf(ph) !== -1) || (a && a.indexOf(ph) !== -1)) { hit = true; break; }
+                                    }
+                                    if (!hit) continue;
+                                    try { n.scrollIntoView({block:'center'}); } catch(e){}
+                                    try { n.click(); } catch(e){}
                                 }
                                 // Also try to click any paragraph-like area inside dialog
                                 var ps = dlg.querySelectorAll('div, p, span');
@@ -1294,7 +1824,7 @@ class App(tk.Tk):
                         editor = None
 
                 if not editor:
-                    self._log("⚠️ [Lịch] Không tìm thấy ô nhập nội dung trong dialog", "warn")
+                    self._log(f"⚠️ {log_tag} Không tìm thấy ô nhập nội dung trong dialog", "warn")
                 else:
                     # Click/focus before typing
                     try:
@@ -1306,9 +1836,9 @@ class App(tk.Tk):
                     # Double-check what's actually in the editor
                     actual = _get_editor_text(editor)
                     if ok_text and actual and text.strip()[:10] in actual:
-                        self._log(f"✍️ [Lịch] Đã nhập nội dung ({len(actual)} ký tự)", "ok")
+                        self._log(f"✍️ {log_tag} Đã nhập nội dung ({len(actual)} ký tự)", "ok")
                     else:
-                        self._log(f"⚠️ [Lịch] Nhập nội dung có thể chưa thành công (actual: '{actual[:50]}...')", "warn")
+                        self._log(f"⚠️ {log_tag} Nhập nội dung có thể chưa thành công (actual: '{actual[:50]}...')", "warn")
 
             # 3) Attach image (if any)
             if img_path and os.path.isfile(img_path) and not _stop_requested() and not self._is_action_blocked():
@@ -1360,7 +1890,7 @@ class App(tk.Tk):
                 if file_input:
                     try:
                         file_input.send_keys(img_path)
-                        self._log("🖼️ [Lịch] Đã chọn ảnh, chờ tải lên...", "info")
+                        self._log(f"🖼️ {log_tag} Đã chọn ảnh, chờ tải lên...", "info")
                         for _ in range(60):
                             if _stop_requested() or self._is_action_blocked():
                                 break
@@ -1387,11 +1917,11 @@ class App(tk.Tk):
                                 busy = False
                             if not busy:
                                 break
-                        self._log("🖼️ [Lịch] Ảnh đã tải lên xong", "ok")
+                        self._log(f"🖼️ {log_tag} Ảnh đã tải lên xong", "ok")
                     except Exception:
-                        self._log("⚠️ [Lịch] Upload ảnh có thể thất bại", "warn")
+                        self._log(f"⚠️ {log_tag} Upload ảnh có thể thất bại", "warn")
                 else:
-                    self._log("⚠️ [Lịch] Không tìm thấy input file trong dialog", "warn")
+                    self._log(f"⚠️ {log_tag} Không tìm thấy input file trong dialog", "warn")
 
             if self._is_action_blocked() or _stop_requested():
                 return False
@@ -1415,7 +1945,7 @@ class App(tk.Tk):
                     dlg_count = 0
 
                 if dlg_count == 0:
-                    self._log("⚠️ [Lịch] Composer đã đóng trước khi bấm Tiếp/Đăng; dừng lượt này để tránh comment nhầm", "warn")
+                    self._log(f"⚠️ {log_tag} Composer đã đóng trước khi bấm Tiếp/Đăng; dừng lượt này để tránh comment nhầm", "warn")
                     return False
 
                 # Dismiss "Rời khỏi trang?" / "Leave page?" popups
@@ -1427,14 +1957,20 @@ class App(tk.Tk):
                 if tiep_count < max_tiep:
                     if _click_in_top_dialog(["tiếp", "tiep", "next", "tiếp tục", "tiep tuc", "continue"], timeout=1.2, use_composer_scope=True):
                         tiep_count += 1
-                        self._log(f"➡️ [Lịch] Đã bấm Tiếp ({tiep_count}/{max_tiep})", "info")
-                        time.sleep(2.5)  # Wait for page to transition to settings
+                        self._log(f"➡️ {log_tag} Đã bấm Tiếp ({tiep_count}/{max_tiep})", "info")
+                        time.sleep(3.5)  # Wait longer for Page composer to transition
                         continue
 
                 # Phase 2: After "Tiếp", look for "Đăng"
                 if tiep_count > 0 or _step >= 5:
-                    if _click_in_top_dialog(["đăng", "dang", "post", "xuất bản", "xuat ban", "publish"], timeout=1.5, use_composer_scope=True):
-                        self._log("📤 [Lịch] Đã bấm Đăng", "info")
+                    if _click_in_top_dialog([
+                        "đăng", "dang", "post",
+                        "đăng ngay", "dang ngay",
+                        "chia sẻ ngay", "chia se ngay",
+                        "xuất bản", "xuat ban", "publish",
+                        "lên lịch", "len lich", "schedule",
+                    ], timeout=1.8, use_composer_scope=True):
+                        self._log(f"📤 {log_tag} Đã bấm Đăng", "info")
                         posted = True
                         time.sleep(1.5)
                         break
@@ -1477,7 +2013,7 @@ class App(tk.Tk):
                             return info.join('\\n');
                             """
                         )
-                        self._log(f"🔍 [Lịch] Buttons (step {_step}):\n{btn_info}", "info")
+                        self._log(f"🔍 {log_tag} Buttons (step {_step}):\n{btn_info}", "info")
                     except Exception:
                         pass
 
@@ -1510,7 +2046,7 @@ class App(tk.Tk):
             return posted
         except Exception as e:
             try:
-                self._log(f"❌ [Lịch] Lỗi khi đăng: {e}", "err")
+                self._log(f"❌ {log_tag} Lỗi khi đăng: {e}", "err")
             except Exception:
                 pass
             return False
@@ -1659,6 +2195,32 @@ class App(tk.Tk):
                            font=FONT_B, bg=BG_DARK, fg=FG_MUTED, bd=1, relief="groove")
         gf.pack(fill="x", padx=14, pady=(4, 6))
 
+        # Quick search
+        search_row = tk.Frame(gf, bg=BG_DARK)
+        search_row.pack(fill="x", padx=10, pady=(6, 4))
+        tk.Label(search_row, text="Tìm nhanh:", font=FONT, bg=BG_DARK, fg=FG_LIGHT).pack(side="left")
+        search_entry = tk.Entry(
+            search_row,
+            textvariable=self.comment_group_search_var,
+            font=FONT,
+            bg=BG_PANEL,
+            fg=FG_LIGHT,
+            relief="flat",
+        )
+        search_entry.pack(side="left", padx=(8, 6), fill="x", expand=True)
+        tk.Button(
+            search_row,
+            text="Xoá",
+            font=FONT_B,
+            bg=BG_PANEL,
+            fg=FG_LIGHT,
+            activebackground=BG_CARD,
+            activeforeground=FG_LIGHT,
+            relief="flat",
+            cursor="hand2",
+            command=lambda: self.comment_group_search_var.set(""),
+        ).pack(side="left")
+
         # Scrollable group list - FIXED HEIGHT
         group_canvas_frame = tk.Frame(gf, bg=BG_DARK)
         group_canvas_frame.pack(fill="x", padx=10, pady=(4, 8))
@@ -1676,6 +2238,11 @@ class App(tk.Tk):
         def _on_group_frame_configure(event):
             group_canvas.configure(scrollregion=group_canvas.bbox("all"))
         self.group_list_frame.bind("<Configure>", _on_group_frame_configure)
+
+        try:
+            self.comment_group_search_var.trace_add("write", lambda *_: self._apply_comment_group_filter())
+        except Exception:
+            pass
 
         self.lbl_comment_selected = tk.Label(
             gf,
@@ -1921,6 +2488,7 @@ class App(tk.Tk):
         self.btn_stop_approval.pack(side="left", padx=(0, 6))
 
         self._btn(right_btns, "💾  Lưu", self._save_approval_config, "#6ab04c").pack(side="left")
+        self._set_run_buttons(self.btn_start_approval, self.btn_stop_approval, False, ACCENT, "#e74c3c")
 
         # Group selection
         gf = tk.LabelFrame(parent, text="  Chọn nhóm Facebook (hãy chọn các nhóm bạn là quản trị viên)  ",
@@ -2043,8 +2611,8 @@ class App(tk.Tk):
     def _get_appdata_dir(self):
         """Return config/cache directory under AppData Roaming and ensure it exists."""
         try:
-            base = os.environ.get("APPDATA") or os.path.expanduser("~")
-            path = os.path.join(base, "FBTextFixer")
+            base = os.path.dirname(__file__)
+            path = os.path.join(base, "FBTextFixerData")
             os.makedirs(path, exist_ok=True)
             return path
         except Exception:
@@ -2055,6 +2623,164 @@ class App(tk.Tk):
                          font=FONT_B, bg=bg, fg=FG_LIGHT,
                          activebackground=BG_PANEL, activeforeground=FG_LIGHT,
                          relief="flat", cursor="hand2", padx=14, pady=5)
+
+    def _set_run_buttons(self, start_btn, stop_btn, running, start_bg, stop_bg):
+        if not start_btn or not stop_btn:
+            return
+        if running:
+            start_btn.configure(state="disabled", bg=BG_PANEL)
+            stop_btn.configure(state="normal", bg=stop_bg)
+        else:
+            start_btn.configure(state="normal", bg=start_bg)
+            stop_btn.configure(state="disabled", bg=BG_PANEL)
+
+    def _strip_links(self, text):
+        if not text:
+            return ""
+        t = re.sub(r"https?://\S+", "", text)
+        t = re.sub(r"www\.\S+", "", t)
+        lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+        return "\n".join(lines).strip()
+
+    def _strip_phones(self, text):
+        if not text:
+            return ""
+        t = re.sub(r"\+?\d[\d\s\-\(\)]{7,}\d", "", text)
+        lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+        return "\n".join(lines).strip()
+
+    def _sanitize_text_for_pending(self, text):
+        return self._strip_phones(self._strip_links(text))
+
+    def _detect_pending_comment(self, post_el):
+        try:
+            phrases = [
+                "đang chờ",
+                "chờ phê duyệt",
+                "chờ xét duyệt",
+                "pending",
+                "awaiting",
+                "awaiting approval",
+                "pending approval",
+                "needs approval",
+                "dang cho",
+                "cho phe duyet",
+                "cho xet duyet",
+            ]
+            return self.driver.execute_script(
+                """
+                var post = arguments[0];
+                var phrases = arguments[1] || [];
+                if (!post) return '';
+                function norm(s){
+                    try { return (s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+                    catch(e){ return (s||'').toLowerCase(); }
+                }
+                function hasPhrase(t){
+                    var n = norm(t);
+                    for (var i=0;i<phrases.length;i++) {
+                        if (n.indexOf(norm(phrases[i])) !== -1) return phrases[i];
+                    }
+                    return '';
+                }
+
+                var text = (post.innerText || post.textContent || '');
+                var hit = hasPhrase(text);
+                if (hit) return hit;
+
+                function scanNodes(nodes, limit){
+                    for (var j=0; j<nodes.length && j<limit; j++) {
+                        var t = nodes[j].innerText || nodes[j].textContent || '';
+                        var hit = hasPhrase(t);
+                        if (hit) return hit;
+
+                        var a = nodes[j].getAttribute && (nodes[j].getAttribute('aria-label') || '');
+                        hit = hasPhrase(a || '');
+                        if (hit) return hit;
+                    }
+                    return '';
+                }
+
+                // Check status-like elements inside the post
+                var nodes = post.querySelectorAll('[role="status"], [role="alert"], span, div, a, button');
+                var hit2 = scanNodes(nodes, 200);
+                if (hit2) return hit2;
+
+                // Check nearby elements around the post card (comment status may render outside)
+                var pr = post.getBoundingClientRect();
+                var all = Array.from(document.querySelectorAll('span, div, a, button'));
+                var nearby = [];
+                for (var k=0; k<all.length && nearby.length < 200; k++) {
+                    var el = all[k];
+                    if (!el || !el.getBoundingClientRect) continue;
+                    var r = el.getBoundingClientRect();
+                    var cx = r.left + r.width/2;
+                    var cy = r.top + r.height/2;
+                    var xOK = (cx >= (pr.left - 80)) && (cx <= (pr.right + 80));
+                    var yOK = (cy >= (pr.top - 40)) && (cy <= (pr.bottom + 160));
+                    if (xOK && yOK) nearby.push(el);
+                }
+                var hit3 = scanNodes(nearby, 200);
+                if (hit3) return hit3;
+
+                // Check vicinity of focused element (comment box often keeps focus)
+                try {
+                    var ae = document.activeElement;
+                    if (ae && ae.getBoundingClientRect) {
+                        var ar = ae.getBoundingClientRect();
+                        var aAll = Array.from(document.querySelectorAll('span, div, a, button'));
+                        var around = [];
+                        for (var m=0; m<aAll.length && around.length < 200; m++) {
+                            var el2 = aAll[m];
+                            if (!el2 || !el2.getBoundingClientRect) continue;
+                            var r2 = el2.getBoundingClientRect();
+                            var cx2 = r2.left + r2.width/2;
+                            var cy2 = r2.top + r2.height/2;
+                            var x2 = (cx2 >= (ar.left - 120)) && (cx2 <= (ar.right + 120));
+                            var y2 = (cy2 >= (ar.top - 80)) && (cy2 <= (ar.bottom + 200));
+                            if (x2 && y2) around.push(el2);
+                        }
+                        var hit4 = scanNodes(around, 200);
+                        if (hit4) return hit4;
+                    }
+                } catch(e) {}
+                return '';
+                """,
+                post_el,
+                phrases,
+            ) or ""
+        except Exception:
+            return ""
+
+    def _detect_rejected_comment(self, post_el):
+        try:
+            phrases = [
+                "bình luận đã bị từ chối",
+                "tự động từ chối bình luận",
+                "bị từ chối",
+                "đã bị từ chối",
+                "comment rejected",
+                "was rejected",
+                "has been rejected",
+                "removed",
+                "đã bị gỡ",
+            ]
+            return self.driver.execute_script(
+                """
+                var post = arguments[0];
+                var phrases = arguments[1] || [];
+                if (!post) return '';
+                var text = (post.innerText || post.textContent || '').toLowerCase();
+                for (var i=0;i<phrases.length;i++) {
+                    if (text.indexOf(phrases[i]) !== -1) return phrases[i];
+                }
+                return '';
+                """,
+                post_el,
+                phrases,
+            ) or ""
+        except Exception:
+            return ""
 
     def _log(self, msg, tag="info"):
         self.log_box.configure(state="normal")
@@ -2242,7 +2968,7 @@ class App(tk.Tk):
 
         # Profile riêng của app (lưu phiên đăng nhập cho các lần sau)
         profile_suffix = f"_{self.profile_name}" if self.profile_name != "default" else ""
-        app_profile = rf"C:\Users\Public\fb_text_fixer\fb_chrome_profile{profile_suffix}"
+        app_profile = os.path.join(os.path.dirname(__file__), f"fb_chrome_profile{profile_suffix}")
         app_default = os.path.join(app_profile, "Default")
         os.makedirs(app_default, exist_ok=True)
 
@@ -2377,6 +3103,17 @@ class App(tk.Tk):
     def _open_browser_thread(self):
         try:
             self._init_driver()
+
+            def _is_service_unavailable():
+                try:
+                    txt = self.driver.execute_script(
+                        "return (document.body && (document.body.innerText || document.body.textContent) || '').toLowerCase();"
+                    ) or ""
+                    return ("service unavailable" in txt
+                            or "dịch vụ hiện không khả dụng" in txt
+                            or "tạm thời không truy cập" in txt)
+                except Exception:
+                    return False
             
             # Đơn giản: navigate trực tiếp, chờ trang load xong
             self._log("🌐  Đang điều hướng đến facebook.com...", "info")
@@ -2389,6 +3126,23 @@ class App(tk.Tk):
             # Kiểm tra URL hiện tại
             current = self.driver.current_url
             self._log(f"📍  URL hiện tại: {current}", "info")
+
+            # Nếu gặp Service Unavailable trong profile Selenium, thử làm sạch cookie rồi vào lại
+            if _is_service_unavailable():
+                self._log("⚠  Facebook báo Service Unavailable trong phiên Chrome tự động. Thử làm sạch cookie...", "warn")
+                try:
+                    self.driver.delete_all_cookies()
+                except Exception:
+                    pass
+                time.sleep(1)
+                self.driver.get("https://m.facebook.com/")
+                time.sleep(4)
+                if _is_service_unavailable():
+                    self._log("⚠  Vẫn lỗi Service Unavailable. Thử lại facebook.com...", "warn")
+                    self.driver.get("https://www.facebook.com/?_rdr")
+                    time.sleep(4)
+                current = self.driver.current_url
+                self._log(f"📍  URL sau khi thử lại: {current}", "info")
             
             # Nếu không phải Facebook, thử lại
             if "facebook.com" not in current.lower():
@@ -2408,7 +3162,11 @@ class App(tk.Tk):
                     self._log("🔐  Chrome đã mở Facebook. Hãy đăng nhập xong rồi chạy lại app.", "warn")
                     self.btn_login.configure(state="normal", text="🌐  Mở Chrome & Đăng nhập")
             else:
-                self._log(f"❌  Không thể mở Facebook. URL hiện tại: {current}", "err")
+                if _is_service_unavailable():
+                    self._log("❌  Facebook báo Service Unavailable trong profile tự động.", "err")
+                    self._log("👉  Gợi ý: xoá thư mục fb_chrome_profile để tạo profile mới, rồi đăng nhập lại.", "warn")
+                else:
+                    self._log(f"❌  Không thể mở Facebook. URL hiện tại: {current}", "err")
                 self.btn_login.configure(state="normal", text="🌐  Mở Chrome & Đăng nhập")
 
         except Exception as e:
@@ -4566,17 +5324,26 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f"❌ Lỗi khi tải nhóm: {e}", "err")
     
-    def _update_group_list(self, groups, selected_set=None):
+    def _update_group_list(self, groups, selected_set=None, update_source=True):
         """Update the scrollable group checkbox list."""
+        if update_source:
+            self.comment_groups_all = list(groups or [])
+
         # Clear existing checkboxes
         for widget in self.group_list_frame.winfo_children():
             widget.destroy()
         self.selected_groups.clear()
 
         if selected_set is None:
-            selected_set = set(self._pending_selected_group_urls or [])
+            if self.comment_selected_urls:
+                selected_set = set(self.comment_selected_urls)
+            else:
+                selected_set = set(self._pending_selected_group_urls or [])
         else:
             selected_set = set(selected_set)
+
+        if update_source:
+            self.comment_selected_urls = set(selected_set)
         
         # Add checkboxes for each group
         for idx, group in enumerate(groups):
@@ -4600,10 +5367,18 @@ class App(tk.Tk):
         self._update_comment_selected_count()
 
         # Cache scanned groups for next launch (tied to current FB account)
+        if update_source:
+            try:
+                selected_urls = list(self.comment_selected_urls)
+                self._save_group_cache(self.comment_groups_cache_file, self.comment_groups_all, selected_urls)
+                self._pending_selected_group_urls.clear()
+            except Exception:
+                pass
+
+        # Sync to group-post tab (reuse same group list)
         try:
-            selected_urls = [url for url, data in self.selected_groups.items() if data['var'].get()]
-            self._save_group_cache(self.comment_groups_cache_file, groups, selected_urls)
-            self._pending_selected_group_urls.clear()
+            if getattr(self, "group_post_list_frame", None) is not None:
+                self._update_group_post_list(self.comment_groups_all, selected_set=self.group_post_selected_urls, update_source=True)
         except Exception:
             pass
     
@@ -4669,21 +5444,294 @@ class App(tk.Tk):
 
     def _on_comment_group_selection_changed(self):
         try:
-            selected_urls = [url for url, data in self.selected_groups.items() if data['var'].get()]
-            groups = [{"name": v.get("name"), "url": k} for k, v in self.selected_groups.items()]
-            if groups:
-                self._save_group_cache(self.comment_groups_cache_file, groups, selected_urls)
-            self._log(f"✅ Đã chọn {len(selected_urls)} nhóm (Auto Comment)", "info")
+            visible_urls = set(self.selected_groups.keys())
+            selected_visible = {url for url, data in self.selected_groups.items() if data['var'].get()}
+            self.comment_selected_urls = (self.comment_selected_urls - visible_urls) | selected_visible
+
+            if self.comment_groups_all:
+                self._save_group_cache(self.comment_groups_cache_file, self.comment_groups_all, list(self.comment_selected_urls))
+            self._log(f"✅ Đã chọn {len(self.comment_selected_urls)} nhóm (Auto Comment)", "info")
             self._update_comment_selected_count()
         except Exception:
             pass
 
     def _update_comment_selected_count(self):
         try:
-            cnt = len([1 for _url, data in self.selected_groups.items() if data['var'].get()])
+            cnt = len(self.comment_selected_urls) if self.comment_selected_urls else len(
+                [1 for _url, data in self.selected_groups.items() if data['var'].get()]
+            )
             self.comment_selected_count_var.set(f"Đã chọn: {cnt} nhóm")
         except Exception:
             pass
+
+    def _update_group_post_list(self, groups, selected_set=None, update_source=True):
+        if not getattr(self, "group_post_list_frame", None):
+            return
+
+        if update_source:
+            self.group_post_groups_all = list(groups or [])
+
+        for widget in self.group_post_list_frame.winfo_children():
+            widget.destroy()
+        self.group_post_selected_groups.clear()
+
+        if selected_set is None:
+            selected_set = set(self.group_post_selected_urls or [])
+        else:
+            selected_set = set(selected_set)
+
+        if update_source:
+            self.group_post_selected_urls = set(selected_set)
+
+        for group in groups:
+            var = tk.BooleanVar(value=group.get('url') in selected_set)
+            self.group_post_selected_groups[group['url']] = {'var': var, 'name': group['name']}
+            display_name = group['name'] if len(group['name']) <= 80 else f"{group['name'][:77]}..."
+            if self.group_post_pending_required.get(group.get("url")) is True:
+                display_name = f"{display_name}  [Cần duyệt]"
+            chk = tk.Checkbutton(
+                self.group_post_list_frame,
+                text=display_name,
+                variable=var,
+                font=FONT,
+                bg=BG_PANEL,
+                fg=FG_LIGHT,
+                activebackground=BG_PANEL,
+                activeforeground=ACCENT,
+                selectcolor=BG_PANEL,
+                anchor="w",
+                wraplength=900,
+                command=self._on_group_post_selection_changed,
+            )
+            chk.pack(fill="x", padx=10, pady=1)
+
+        self._log(f"  📋 Hiển thị {len(groups)} nhóm trong tab đăng bài", "info")
+        self._update_group_post_selected_count()
+
+        if update_source:
+            try:
+                selected_urls = list(self.group_post_selected_urls)
+                self._save_group_cache(self.group_post_groups_cache_file, self.group_post_groups_all, selected_urls)
+            except Exception:
+                pass
+
+    def _toggle_all_group_post(self, select: bool):
+        for group_data in self.group_post_selected_groups.values():
+            group_data['var'].set(select)
+        self._on_group_post_selection_changed()
+
+    def _on_group_post_selection_changed(self):
+        try:
+            visible_urls = set(self.group_post_selected_groups.keys())
+            selected_visible = {url for url, data in self.group_post_selected_groups.items() if data['var'].get()}
+            self.group_post_selected_urls = (self.group_post_selected_urls - visible_urls) | selected_visible
+
+            if self.group_post_groups_all:
+                self._save_group_cache(self.group_post_groups_cache_file, self.group_post_groups_all, list(self.group_post_selected_urls))
+            self._log(f"✅ Đã chọn {len(self.group_post_selected_urls)} nhóm (Đăng bài nhóm)", "info")
+            self._update_group_post_selected_count()
+        except Exception:
+            pass
+
+    def _update_group_post_selected_count(self):
+        try:
+            self.group_post_selected_count_var.set(f"Đã chọn: {len(self.group_post_selected_urls)} nhóm")
+        except Exception:
+            pass
+
+    def _set_group_post_pending_required(self, group_url, required):
+        try:
+            self.group_post_pending_required[str(group_url)] = bool(required)
+            if getattr(self, "group_post_list_frame", None) is not None:
+                self._update_group_post_list(self.group_post_groups_all, selected_set=self.group_post_selected_urls, update_source=False)
+        except Exception:
+            pass
+
+    def _scan_group_post_pending_for_groups(self):
+        if not self.logged_in:
+            messagebox.showwarning("Chưa đăng nhập", "Vui lòng đăng nhập Facebook trước!")
+            return
+
+        if not self.driver:
+            messagebox.showwarning("Chưa mở Chrome", "Vui lòng mở Chrome và đăng nhập trước!")
+            return
+
+        selected = [url for url, data in self.group_post_selected_groups.items() if data['var'].get()]
+        if not selected:
+            selected = [g.get("url") for g in (self.group_post_groups_all or []) if g.get("url")]
+        if not selected:
+            messagebox.showwarning("Chưa có nhóm", "Vui lòng tải danh sách nhóm trước!")
+            return
+
+        threading.Thread(target=self._scan_group_post_pending_worker, args=(selected,), daemon=True).start()
+
+    def _scan_group_post_pending_worker(self, group_urls):
+        try:
+            self._log(f"🔎 [Nhóm] Đang quét kiểm duyệt cho {len(group_urls)} nhóm...", "info")
+            for idx, group_url in enumerate(group_urls, 1):
+                if self.group_post_stop_event.is_set() or self.group_post_schedule_stop_event.is_set():
+                    break
+                required = self._detect_group_post_requires_approval(group_url)
+                if required is None:
+                    self._log(f"  ⚠️ [Nhóm] Không xác định kiểm duyệt: {group_url}", "warn")
+                    continue
+                self._set_group_post_pending_required(group_url, required)
+                if required:
+                    self._log(f"  🧷 [Nhóm] Cần kiểm duyệt: {group_url}", "info")
+                else:
+                    self._log(f"  ✅ [Nhóm] Cho đăng ngay: {group_url}", "info")
+                if idx % 8 == 0:
+                    time.sleep(1.0)
+            self._log("✅ [Nhóm] Quét kiểm duyệt xong.", "ok")
+        except Exception as e:
+            self._log(f"❌ [Nhóm] Lỗi quét kiểm duyệt: {e}", "err")
+
+    def _detect_group_post_requires_approval(self, group_url):
+        if not self.driver:
+            return None
+        try:
+            self.driver.get(group_url)
+            time.sleep(3)
+        except Exception:
+            return None
+
+        try:
+            self._close_all_dialogs(aggressive=False)
+        except Exception:
+            pass
+
+        try:
+            hit = self.driver.execute_script(
+                """
+                function norm(s){ return (s||'').toLowerCase(); }
+                var t = norm(document.body && (document.body.innerText || document.body.textContent) || '');
+                if (!t) return '';
+                var needles = [
+                    'bài viết cần phê duyệt',
+                    'bài viết của bạn đang chờ phê duyệt',
+                    'bài viết của bạn sẽ được phê duyệt',
+                    'bài viết sẽ được phê duyệt',
+                    'bài viết đang chờ',
+                    'đang chờ phê duyệt',
+                    'chờ phê duyệt',
+                    'posts must be approved',
+                    'post must be approved',
+                    'require approval',
+                    'requires approval',
+                    'admin approval',
+                    'post is pending',
+                    'pending post'
+                ];
+                for (var i=0;i<needles.length;i++){
+                    if (t.indexOf(needles[i]) !== -1) return needles[i];
+                }
+                return '';
+                """
+            )
+        except Exception:
+            hit = ""
+
+        if hit is None:
+            return None
+        return bool(hit)
+
+    def _apply_group_post_filter(self):
+        try:
+            term_raw = (self.group_post_search_var.get() or "").strip()
+            if not self.group_post_groups_all:
+                return
+            if not term_raw:
+                filtered = list(self.group_post_groups_all)
+            else:
+                term = self._normalize_search_text(term_raw)
+                tokens = [t for t in term.split() if t]
+
+                def _matches(name, url):
+                    n = self._normalize_search_text(name)
+                    u = self._normalize_search_text(url)
+                    if term in n or term in u:
+                        return True
+                    if tokens:
+                        return all(any(tok in part for part in n.split()) for tok in tokens)
+                    return self._is_subsequence(term, n)
+
+                filtered = [
+                    g for g in self.group_post_groups_all
+                    if _matches(g.get("name", ""), g.get("url", ""))
+                ]
+            self._update_group_post_list(filtered, selected_set=self.group_post_selected_urls, update_source=False)
+        except Exception:
+            pass
+
+    def _clear_group_post_list(self):
+        try:
+            if getattr(self, "group_post_list_frame", None) is None:
+                return
+            for widget in self.group_post_list_frame.winfo_children():
+                widget.destroy()
+            self.group_post_selected_groups.clear()
+            self.group_post_groups_all = []
+            self.group_post_selected_urls = set()
+            self._update_group_post_selected_count()
+        except Exception:
+            pass
+
+    def _choose_group_post_image(self, idx):
+        filename = filedialog.askopenfilename(
+            title="Chọn ảnh",
+            filetypes=[("Image files", "*.jpg *.jpeg *.png *.gif"), ("All files", "*.*")]
+        )
+        if filename:
+            try:
+                self.group_post_slots[idx]["image"].set(filename)
+                self._log(f"📷 [Nhóm] Đã chọn ảnh mẫu {idx+1}: {os.path.basename(filename)}", "info")
+            except Exception:
+                pass
+
+    def _apply_comment_group_filter(self):
+        try:
+            term_raw = (self.comment_group_search_var.get() or "").strip()
+            if not self.comment_groups_all:
+                return
+            if not term_raw:
+                filtered = list(self.comment_groups_all)
+            else:
+                term = self._normalize_search_text(term_raw)
+                tokens = [t for t in term.split() if t]
+
+                def _matches(name, url):
+                    n = self._normalize_search_text(name)
+                    u = self._normalize_search_text(url)
+                    # Exact contains
+                    if term in n or term in u:
+                        return True
+                    # Token partial match
+                    if tokens:
+                        return all(any(tok in part for part in n.split()) for tok in tokens)
+                    # Fuzzy subsequence
+                    return self._is_subsequence(term, n)
+
+                filtered = [
+                    g for g in self.comment_groups_all
+                    if _matches(g.get("name", ""), g.get("url", ""))
+                ]
+            self._update_group_list(filtered, selected_set=self.comment_selected_urls, update_source=False)
+        except Exception:
+            pass
+
+    def _normalize_search_text(self, text):
+        try:
+            t = (text or "").strip().lower()
+            t = ''.join(ch for ch in unicodedata.normalize('NFD', t) if unicodedata.category(ch) != 'Mn')
+            return t
+        except Exception:
+            return (text or "").strip().lower()
+
+    def _is_subsequence(self, needle, haystack):
+        if not needle:
+            return True
+        it = iter(haystack or "")
+        return all(ch in it for ch in needle)
 
     def _on_approval_group_selection_changed(self):
         try:
@@ -4829,12 +5877,27 @@ class App(tk.Tk):
         except Exception:
             pass
 
+        try:
+            data = self._load_group_cache(self.group_post_groups_cache_file)
+            if data:
+                groups = data.get("groups") or []
+                self.group_post_selected_urls = set(data.get("selected") or [])
+                if groups and getattr(self, "group_post_list_frame", None) is not None:
+                    self._update_group_post_list(groups, selected_set=self.group_post_selected_urls, update_source=True)
+                    self._log(f"📂 Đã phục hồi {len(groups)} nhóm từ cache (Đăng bài nhóm)", "info")
+        except Exception:
+            pass
+
     def _clear_comment_group_list(self):
         try:
             for widget in self.group_list_frame.winfo_children():
                 widget.destroy()
             self.selected_groups.clear()
+            self.comment_groups_all = []
+            self.comment_selected_urls = set()
             self._update_comment_selected_count()
+            if getattr(self, "group_post_list_frame", None) is not None:
+                self._clear_group_post_list()
         except Exception:
             pass
 
@@ -4919,7 +5982,7 @@ class App(tk.Tk):
         mode = self.approval_mode_var.get()
         interval = max(1, int(self.approval_interval_var.get() or 1))
 
-        self.btn_start_approval.configure(state="disabled")
+        self._set_run_buttons(self.btn_start_approval, self.btn_stop_approval, True, ACCENT, "#e74c3c")
         self._log(
             f"▶️ Bắt đầu auto duyệt bài cho {len(selected)} nhóm (chế độ: {mode}, chu kỳ {interval} phút)",
             "info",
@@ -4931,7 +5994,7 @@ class App(tk.Tk):
 
     def _stop_group_approval(self):
         self.approval_stop_event.set()
-        self.btn_start_approval.configure(state="normal")
+        self._set_run_buttons(self.btn_start_approval, self.btn_stop_approval, False, ACCENT, "#e74c3c")
         self._log("⏹ Đã yêu cầu dừng auto duyệt bài", "warn")
 
     def _group_approval_worker(self, group_urls, blocked_keywords, mode, interval_minutes):
@@ -4970,7 +6033,7 @@ class App(tk.Tk):
         finally:
             self._log("🔕 Đã dừng auto duyệt bài nhóm", "warn")
             try:
-                self.after(0, lambda: self.btn_start_approval.configure(state="normal"))
+                self.after(0, lambda: self._set_run_buttons(self.btn_start_approval, self.btn_stop_approval, False, ACCENT, "#e74c3c"))
             except Exception:
                 pass
 
@@ -5073,214 +6136,1012 @@ class App(tk.Tk):
             self._log("⛔ Facebook đang hạn chế thao tác khi vào trang duyệt bài.", "err")
             return
 
+        # Close stray dialogs/menus (e.g., notifications) that can hide toolbar buttons
+        try:
+            self._close_all_dialogs(aggressive=False)
+        except Exception:
+            pass
+
         from selenium.webdriver.common.action_chains import ActionChains
 
-        posts = []
-        try:
-            # Giao diện cũ: mỗi bài là 1 div[role="article"]
-            posts = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
-        except Exception:
-            posts = []
-
-        # Nếu không tìm thấy gì, thử giao diện mới: dò theo nút "Phê duyệt" / "Từ chối"
-        if not posts:
+        def _find_pending_posts():
+            posts_local = []
             try:
-                posts = self.driver.execute_script(
-                    """
-                    function norm(s){ return (s||'').toLowerCase(); }
-
-                    // Tìm tất cả các nút có text liên quan tới Phê duyệt / Từ chối
-                    var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
-                    var roots = [];
-                    var seen = new Set();
-
-                    function findRoot(el){
-                        var cur = el;
-                        // Đi lên tối đa 8 cấp để tìm khối bao quanh bài viết
-                        for (var i=0; i<8 && cur; i++){
-                            try {
-                                var role = (cur.getAttribute && cur.getAttribute('role')) || '';
-                                if (role === 'article') return cur;
-                            } catch(e) {}
-                            cur = cur.parentElement;
-                        }
-                        return el.parentElement || el;
-                    }
-
-                    for (var i=0; i<btns.length; i++){
-                        var t = norm(btns[i].innerText || btns[i].textContent);
-                        if (!t) continue;
-                        if (
-                            t.indexOf('phê duyệt') !== -1 || t.indexOf('phe duyet') !== -1 ||
-                            t.indexOf('duyệt') !== -1      ||
-                            t.indexOf('approve') !== -1    ||
-                            t.indexOf('chấp thuận') !== -1 ||
-                            t.indexOf('chap thuan') !== -1 ||
-                            t.indexOf('từ chối') !== -1    || t.indexOf('tu choi') !== -1 ||
-                            t.indexOf('decline') !== -1    || t.indexOf('reject') !== -1
-                        ){
-                            var root = findRoot(btns[i]);
-                            if (!root) continue;
-                            // Dùng toạ độ + chiều cao để phân biệt, tránh trùng lặp
-                            var r;
-                            try { r = root.getBoundingClientRect(); } catch(e) { r = null; }
-                            var key = '';
-                            if (r) {
-                                key = [Math.round(r.top), Math.round(r.left), Math.round(r.width), Math.round(r.height)].join(':');
-                            } else {
-                                key = String(i);
-                            }
-                            if (!seen.has(key)){
-                                seen.add(key);
-                                roots.push(root);
-                            }
-                        }
-                    }
-                    return roots;
-                    """
-                ) or []
+                # Giao diện cũ: mỗi bài là 1 div[role="article"]
+                posts_local = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
             except Exception:
-                posts = []
+                posts_local = []
 
-        if not posts:
-            # Nếu tiêu đề báo vẫn còn bài chờ duyệt, thử làm tươi nhẹ rồi quét lại 1 lần
-            if pending_count_hint is not None and pending_count_hint > 0:
+            # Nếu không tìm thấy gì, thử giao diện mới: dò theo nút "Phê duyệt" / "Từ chối"
+            if not posts_local:
                 try:
-                    self.driver.execute_script("window.scrollTo(0, 0);")
-                    time.sleep(0.8)
-                    self.driver.execute_script("window.scrollBy(0, 600);")
-                    time.sleep(0.8)
-                    posts = self.driver.execute_script(
+                    posts_local = self.driver.execute_script(
                         """
                         function norm(s){ return (s||'').toLowerCase(); }
+
+                        // Tìm tất cả các nút có text liên quan tới Phê duyệt / Từ chối
                         var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
                         var roots = [];
                         var seen = new Set();
+
                         function findRoot(el){
                             var cur = el;
-                            for (var i=0; i<10 && cur; i++){
-                                try { if ((cur.getAttribute && cur.getAttribute('role')) === 'article') return cur; } catch(e) {}
+                            // Đi lên tối đa 8 cấp để tìm khối bao quanh bài viết
+                            for (var i=0; i<8 && cur; i++){
+                                try {
+                                    var role = (cur.getAttribute && cur.getAttribute('role')) || '';
+                                    if (role === 'article') return cur;
+                                } catch(e) {}
                                 cur = cur.parentElement;
                             }
                             return el.parentElement || el;
                         }
+
                         for (var i=0; i<btns.length; i++){
                             var t = norm(btns[i].innerText || btns[i].textContent);
                             if (!t) continue;
-                            if (t.indexOf('phê duyệt')!==-1 || t.indexOf('phe duyet')!==-1 || t.indexOf('approve')!==-1 || t.indexOf('từ chối')!==-1 || t.indexOf('tu choi')!==-1 || t.indexOf('decline')!==-1 || t.indexOf('reject')!==-1){
+                            if (
+                                t.indexOf('phê duyệt') !== -1 || t.indexOf('phe duyet') !== -1 ||
+                                t.indexOf('duyệt') !== -1      ||
+                                t.indexOf('approve') !== -1    ||
+                                t.indexOf('chấp thuận') !== -1 ||
+                                t.indexOf('chap thuan') !== -1 ||
+                                t.indexOf('từ chối') !== -1    || t.indexOf('tu choi') !== -1 ||
+                                t.indexOf('decline') !== -1    || t.indexOf('reject') !== -1
+                            ){
                                 var root = findRoot(btns[i]);
                                 if (!root) continue;
-                                var r = root.getBoundingClientRect();
-                                var key = [Math.round(r.top), Math.round(r.left), Math.round(r.width), Math.round(r.height)].join(':');
-                                if (!seen.has(key)) { seen.add(key); roots.push(root); }
+                                // Dùng toạ độ + chiều cao để phân biệt, tránh trùng lặp
+                                var r;
+                                try { r = root.getBoundingClientRect(); } catch(e) { r = null; }
+                                var key = '';
+                                if (r) {
+                                    key = [Math.round(r.top), Math.round(r.left), Math.round(r.width), Math.round(r.height)].join(':');
+                                } else {
+                                    key = String(i);
+                                }
+                                if (!seen.has(key)){
+                                    seen.add(key);
+                                    roots.push(root);
+                                }
                             }
                         }
                         return roots;
                         """
                     ) or []
                 except Exception:
-                    posts = []
+                    posts_local = []
 
-        if not posts:
-            self._log("ℹ Không tìm thấy bài chờ duyệt nào (hoặc giao diện khác).", "info")
-            return
+            if not posts_local:
+                # Nếu tiêu đề báo vẫn còn bài chờ duyệt, thử làm tươi nhẹ rồi quét lại 1 lần
+                if pending_count_hint is not None and pending_count_hint > 0:
+                    try:
+                        self.driver.execute_script("window.scrollTo(0, 0);")
+                        time.sleep(0.8)
+                        self.driver.execute_script("window.scrollBy(0, 600);")
+                        time.sleep(0.8)
+                        posts_local = self.driver.execute_script(
+                            """
+                            function norm(s){ return (s||'').toLowerCase(); }
+                            var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                            var roots = [];
+                            var seen = new Set();
+                            function findRoot(el){
+                                var cur = el;
+                                for (var i=0; i<10 && cur; i++){
+                                    try { if ((cur.getAttribute && cur.getAttribute('role')) === 'article') return cur; } catch(e) {}
+                                    cur = cur.parentElement;
+                                }
+                                return el.parentElement || el;
+                            }
+                            for (var i=0; i<btns.length; i++){
+                                var t = norm(btns[i].innerText || btns[i].textContent);
+                                if (!t) continue;
+                                if (t.indexOf('phê duyệt')!==-1 || t.indexOf('phe duyet')!==-1 || t.indexOf('approve')!==-1 || t.indexOf('từ chối')!==-1 || t.indexOf('tu choi')!==-1 || t.indexOf('decline')!==-1 || t.indexOf('reject')!==-1){
+                                    var root = findRoot(btns[i]);
+                                    if (!root) continue;
+                                    var r = root.getBoundingClientRect();
+                                    var key = [Math.round(r.top), Math.round(r.left), Math.round(r.width), Math.round(r.height)].join(':');
+                                    if (!seen.has(key)) { seen.add(key); roots.push(root); }
+                                }
+                            }
+                            return roots;
+                            """
+                        ) or []
+                    except Exception:
+                        posts_local = []
 
-        processed = 0
-        approved = 0
-        rejected = 0
+            return posts_local
 
-        for post in posts:
-            if self.approval_stop_event.is_set():
-                break
+        def _get_post_key(post_el):
+            try:
+                return self.driver.execute_script(
+                    """
+                    var art = arguments[0];
+                    if (!art) return '';
+                    var links = art.querySelectorAll('a[href]');
+                    for (var i=0;i<links.length;i++) {
+                        var href = links[i].href || '';
+                        if (!href) continue;
+                        if (href.indexOf('/permalink/') !== -1) return href.split('?')[0];
+                        if (href.indexOf('/posts/') !== -1) return href.split('?')[0];
+                        if (href.indexOf('story_fbid=') !== -1 && href.indexOf('id=') !== -1) {
+                            var m = href.match(/story_fbid=([^&]+)/);
+                            var n = href.match(/id=([^&]+)/);
+                            if (m && n) return (n[1] + ':' + m[1]);
+                        }
+                    }
+                    if (!art.dataset.fbfixerId) {
+                        art.dataset.fbfixerId = 'fbfixer-' + Math.random().toString(36).slice(2);
+                    }
+                    return art.dataset.fbfixerId || '';
+                    """,
+                    post_el,
+                ) or ""
+            except Exception:
+                return ""
 
-            if self._is_action_blocked():
-                self._log("⛔ Facebook đang hạn chế thao tác, dừng duyệt.", "err")
-                break
+        processed_total = 0
+        approved_total = 0
+        rejected_total = 0
+        max_rounds = 6
+        rounds = 0
+        seen_post_keys = set()
+        last_scroll_height = 0
+        no_growth_rounds = 0
+
+        def _click_action_in_post(post_el, action_name):
+            try:
+                return bool(self.driver.execute_script(
+                    """
+                    var root = arguments[0];
+                    var action = arguments[1] || '';
+                    if (!root) return false;
+                    function norm(s){ return (s||'').toLowerCase(); }
+                    function textPack(el){
+                        if (!el) return '';
+                        var t = '';
+                        try { t += ' ' + (el.innerText || el.textContent || ''); } catch(e) {}
+                        try { t += ' ' + (el.getAttribute && (el.getAttribute('aria-label') || '')) || ''; } catch(e) {}
+                        try { t += ' ' + (el.getAttribute && (el.getAttribute('data-tooltip-content') || '')) || ''; } catch(e) {}
+                        return norm(t);
+                    }
+                    function matchAction(s){
+                        if (!s) return false;
+                        if (action === 'approve') {
+                            return s.indexOf('phê duyệt') !== -1 || s.indexOf('phe duyet') !== -1 ||
+                                   s.indexOf('duyệt') !== -1 || s.indexOf('approve') !== -1 ||
+                                   s.indexOf('chấp thuận') !== -1 || s.indexOf('chap thuan') !== -1;
+                        }
+                        return s.indexOf('từ chối') !== -1 || s.indexOf('tu choi') !== -1 ||
+                               s.indexOf('decline') !== -1 || s.indexOf('reject') !== -1;
+                    }
+                    function clickEl(el){
+                        try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch(e) {}
+                        try { el.click(); return true; } catch(e) { return false; }
+                    }
+
+                    var btns = Array.from(root.querySelectorAll('button, [role="button"]'));
+                    for (var i=0;i<btns.length;i++){
+                        var txt = textPack(btns[i]);
+                        if (matchAction(txt)){
+                            if (clickEl(btns[i])) return true;
+                        }
+                    }
+
+                    // Fallback: look for matching buttons near this post's bounding box
+                    var rect = null;
+                    try { rect = root.getBoundingClientRect(); } catch(e) { rect = null; }
+                    if (!rect) return false;
+                    var pad = 18;
+                    var candidates = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    for (var j=0;j<candidates.length;j++){
+                        var t2 = textPack(candidates[j]);
+                        if (!matchAction(t2)) continue;
+                        var r2 = null;
+                        try { r2 = candidates[j].getBoundingClientRect(); } catch(e) { r2 = null; }
+                        if (!r2) continue;
+                        var inBox = (r2.left >= rect.left - pad && r2.right <= rect.right + pad &&
+                                     r2.top >= rect.top - pad && r2.bottom <= rect.bottom + pad);
+                        if (inBox){
+                            if (clickEl(candidates[j])) return true;
+                        }
+                    }
+
+                    // Final fallback: pick the closest matching button to the post
+                    var best = null;
+                    var bestDist = 1e9;
+                    var pcx = rect.left + rect.width/2;
+                    var pcy = rect.top + rect.height/2;
+                    for (var k=0;k<candidates.length;k++){
+                        var t3 = textPack(candidates[k]);
+                        if (!matchAction(t3)) continue;
+                        var r3 = null;
+                        try { r3 = candidates[k].getBoundingClientRect(); } catch(e) { r3 = null; }
+                        if (!r3) continue;
+                        var cx = r3.left + r3.width/2;
+                        var cy = r3.top + r3.height/2;
+                        var dist = Math.abs(cx - pcx) + Math.abs(cy - pcy);
+                        if (dist < bestDist){ bestDist = dist; best = candidates[k]; }
+                    }
+                    if (best){
+                        if (clickEl(best)) return true;
+                    }
+                    return false;
+                    """,
+                    post_el,
+                    action_name,
+                ))
+            except Exception:
+                return False
+
+        def _click_toolbar_action_near_pending_header(action_name):
+            try:
+                return bool(self.driver.execute_script(
+                    """
+                    var action = arguments[0] || '';
+                    function norm(s){ return (s||'').toLowerCase(); }
+                    function textPack(el){
+                        if (!el) return '';
+                        var t = '';
+                        try { t += ' ' + (el.innerText || el.textContent || ''); } catch(e) {}
+                        try { t += ' ' + (el.getAttribute && (el.getAttribute('aria-label') || '')) || ''; } catch(e) {}
+                        try { t += ' ' + (el.getAttribute && (el.getAttribute('data-tooltip-content') || '')) || ''; } catch(e) {}
+                        return norm(t);
+                    }
+                    function matchAction(s){
+                        if (!s) return false;
+                        if (action === 'approve') {
+                            return s.indexOf('phê duyệt') !== -1 || s.indexOf('phe duyet') !== -1 ||
+                                   s.indexOf('duyệt') !== -1 || s.indexOf('approve') !== -1 ||
+                                   s.indexOf('chấp thuận') !== -1 || s.indexOf('chap thuan') !== -1;
+                        }
+                        return s.indexOf('từ chối') !== -1 || s.indexOf('tu choi') !== -1 ||
+                               s.indexOf('decline') !== -1 || s.indexOf('reject') !== -1;
+                    }
+                    function clickEl(el){
+                        try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch(e) {}
+                        try { el.click(); return true; } catch(e) { return false; }
+                    }
+
+                    var headerNodes = Array.from(document.querySelectorAll('h1, h2, h3, span, div'))
+                        .filter(function(el){
+                            var t = norm(el.innerText || el.textContent || '');
+                            return t.indexOf('bài viết đang chờ') !== -1 || t.indexOf('pending posts') !== -1;
+                        });
+                    if (!headerNodes.length) return false;
+
+                    // Choose the first visible header
+                    var header = headerNodes[0];
+                    try {
+                        header = headerNodes.filter(function(n){
+                            var r = n.getBoundingClientRect();
+                            return r.width > 50 && r.height > 10;
+                        })[0] || headerNodes[0];
+                    } catch(e) {}
+
+                    var base = header.closest('div') || header.parentElement;
+                    var scope = base || document.body;
+                    var btns = Array.from(scope.querySelectorAll('button, [role="button"]'));
+                    for (var i=0;i<btns.length;i++){
+                        var t = textPack(btns[i]);
+                        if (!matchAction(t)) continue;
+                        try { if (String(btns[i].getAttribute('aria-disabled')) === 'true') continue; } catch(e) {}
+                        if (clickEl(btns[i])) return true;
+                    }
+
+                    // Wider fallback: check buttons near the header's y-position
+                    try {
+                        var hr = header.getBoundingClientRect();
+                        var all = Array.from(document.querySelectorAll('button, [role="button"]'));
+                        for (var j=0;j<all.length;j++){
+                            var r2 = all[j].getBoundingClientRect();
+                            if (r2.top < hr.top - 60 || r2.top > hr.bottom + 140) continue;
+                            var t2 = textPack(all[j]);
+                            if (!matchAction(t2)) continue;
+                            try { if (String(all[j].getAttribute('aria-disabled')) === 'true') continue; } catch(e) {}
+                            if (clickEl(all[j])) return true;
+                        }
+                    } catch(e) {}
+                    return false;
+                    """,
+                    action_name,
+                ))
+            except Exception:
+                return False
+
+        def _click_checkbox_then_bulk(post_el, action_name):
+            try:
+                return bool(self.driver.execute_script(
+                    """
+                    var post = arguments[0];
+                    var action = arguments[1] || '';
+                    if (!post) return false;
+
+                    function norm(s){ return (s||'').toLowerCase(); }
+                    function textPack(el){
+                        if (!el) return '';
+                        var t = '';
+                        try { t += ' ' + (el.innerText || el.textContent || ''); } catch(e) {}
+                        try { t += ' ' + (el.getAttribute && (el.getAttribute('aria-label') || '')) || ''; } catch(e) {}
+                        try { t += ' ' + (el.getAttribute && (el.getAttribute('data-tooltip-content') || '')) || ''; } catch(e) {}
+                        return norm(t);
+                    }
+                    function matchAction(s){
+                        if (!s) return false;
+                        if (action === 'approve') {
+                            return s.indexOf('phê duyệt') !== -1 || s.indexOf('phe duyet') !== -1 ||
+                                   s.indexOf('duyệt') !== -1 || s.indexOf('approve') !== -1 ||
+                                   s.indexOf('chấp thuận') !== -1 || s.indexOf('chap thuan') !== -1;
+                        }
+                        return s.indexOf('từ chối') !== -1 || s.indexOf('tu choi') !== -1 ||
+                               s.indexOf('decline') !== -1 || s.indexOf('reject') !== -1;
+                    }
+                    function clickEl(el){
+                        try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch(e) {}
+                        try { el.click(); return true; } catch(e) { return false; }
+                    }
+
+                    // Find checkbox inside the post
+                    var checkbox = post.querySelector('[role="checkbox"], input[type="checkbox"]');
+                    if (!checkbox) {
+                        // Fallback: find checkbox near post (new layout puts it outside card)
+                        var rect = null;
+                        try { rect = post.getBoundingClientRect(); } catch(e) { rect = null; }
+                        if (rect) {
+                            var all = Array.from(document.querySelectorAll('[role="checkbox"], input[type="checkbox"]'));
+                            var best = null;
+                            var bestDist = 1e9;
+                            for (var i=0;i<all.length;i++){
+                                var cb = all[i];
+                                var r = null;
+                                try { r = cb.getBoundingClientRect(); } catch(e) { r = null; }
+                                if (!r) continue;
+                                var cx = r.left + r.width/2;
+                                var cy = r.top + r.height/2;
+                                var xOK = (cx >= (rect.left - 120)) && (cx <= (rect.right + 120));
+                                var yOK = (cy >= (rect.top - 40)) && (cy <= (rect.bottom + 200));
+                                if (!xOK || !yOK) continue;
+                                var dist = Math.abs(cx - rect.left) + Math.abs(cy - rect.top);
+                                if (dist < bestDist){ bestDist = dist; best = cb; }
+                            }
+                            if (best) checkbox = best;
+                        }
+                    }
+                    if (checkbox) {
+                        var checked = false;
+                        try { checked = checkbox.getAttribute('aria-checked') === 'true'; } catch(e) {}
+                        if (!checked) {
+                            if (!clickEl(checkbox)) {
+                                // Try clicking the nearest label/container
+                                var label = checkbox.closest('label') || checkbox.parentElement;
+                                if (label) clickEl(label);
+                            }
+                        }
+                    } else {
+                        return false;
+                    }
+
+                    // Click global approve/decline button (toolbar)
+                    var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    for (var i=0;i<btns.length;i++){
+                        var t = textPack(btns[i]);
+                        if (matchAction(t)){
+                            try {
+                                var dis = btns[i].getAttribute('aria-disabled');
+                                if (String(dis) === 'true') continue;
+                            } catch(e) {}
+                            if (clickEl(btns[i])) return true;
+                        }
+                    }
+                    return false;
+                    """,
+                    post_el,
+                    action_name,
+                ))
+            except Exception:
+                return False
+
+        def _click_checkbox_then_bulk_by_element(post_el, action_name):
+            try:
+                checkbox = self.driver.execute_script(
+                    """
+                    var post = arguments[0];
+                    if (!post) return null;
+                    var cb = post.querySelector('[role="checkbox"], input[type="checkbox"]');
+                    if (cb) return cb;
+                    try {
+                        var rect = post.getBoundingClientRect();
+                        var all = Array.from(document.querySelectorAll('[role="checkbox"], input[type="checkbox"]'));
+                        var best = null;
+                        var bestDist = 1e9;
+                        for (var i=0;i<all.length;i++){
+                            var r = all[i].getBoundingClientRect();
+                            var cx = r.left + r.width/2;
+                            var cy = r.top + r.height/2;
+                            var xOK = (cx >= (rect.left - 120)) && (cx <= (rect.right + 120));
+                            var yOK = (cy >= (rect.top - 40)) && (cy <= (rect.bottom + 200));
+                            if (!xOK || !yOK) continue;
+                            var dist = Math.abs(cx - rect.left) + Math.abs(cy - rect.top);
+                            if (dist < bestDist){ bestDist = dist; best = all[i]; }
+                        }
+                        return best;
+                    } catch(e) { return null; }
+                    """,
+                    post_el,
+                )
+            except Exception:
+                checkbox = None
+
+            if checkbox is None:
+                return False
 
             try:
-                # Lấy text bài viết
+                from selenium.webdriver.common.action_chains import ActionChains
+                ActionChains(self.driver).move_to_element(checkbox).click().perform()
+                time.sleep(0.4)
+            except Exception:
+                return False
+
+        def _confirm_post_to_group_dialog():
+            try:
+                return bool(self.driver.execute_script(
+                    """
+                    function norm(s){ return (s||'').replace(/\s+/g,' ').trim().toLowerCase(); }
+                    function isVisible(el){
+                        try {
+                            if (!el) return false;
+                            var r = el.getBoundingClientRect();
+                            if (r.width < 80 || r.height < 60) return false;
+                            var st = window.getComputedStyle(el);
+                            if (st.display === 'none' || st.visibility === 'hidden') return false;
+                            return true;
+                        } catch(e){ return false; }
+                    }
+                    var dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(isVisible);
+                    for (var i=0;i<dialogs.length;i++){
+                        var d = dialogs[i];
+                        var t = norm(d.innerText || d.textContent || '');
+                        if (!t) continue;
+                        if (t.indexOf('đăng lên nhóm') === -1 && t.indexOf('post to group') === -1) continue;
+                        var btns = Array.from(d.querySelectorAll('button, [role="button"]'));
+                        for (var j=0;j<btns.length;j++){
+                            var b = btns[j];
+                            var bt = norm(b.innerText || b.textContent || '');
+                            var bl = norm(b.getAttribute('aria-label') || '');
+                            var label = bt || bl;
+                            if (label === 'đăng' || label === 'post') {
+                                try { b.click(); return true; } catch(e) {}
+                            }
+                        }
+                    }
+                    return false;
+                    """
+                ))
+            except Exception:
+                return False
+
+        def _cancel_preapprove_dialog():
+            try:
+                return bool(self.driver.execute_script(
+                    """
+                    function norm(s){ return (s||'').replace(/\s+/g,' ').trim().toLowerCase(); }
+                    function isVisible(el){
+                        try {
+                            if (!el) return false;
+                            var r = el.getBoundingClientRect();
+                            if (r.width < 80 || r.height < 60) return false;
+                            var st = window.getComputedStyle(el);
+                            if (st.display === 'none' || st.visibility === 'hidden') return false;
+                            return true;
+                        } catch(e){ return false; }
+                    }
+                    var dialogs = Array.from(document.querySelectorAll('[role="dialog"]')).filter(isVisible);
+                    for (var i=0;i<dialogs.length;i++){
+                        var d = dialogs[i];
+                        var t = norm(d.innerText || d.textContent || '');
+                        if (!t) continue;
+                        if (t.indexOf('phê duyệt trước') === -1 && t.indexOf('pre-approve') === -1) continue;
+                        var btns = Array.from(d.querySelectorAll('button, [role="button"]'));
+                        for (var j=0;j<btns.length;j++){
+                            var b = btns[j];
+                            var bt = norm(b.innerText || b.textContent || '');
+                            var bl = norm(b.getAttribute('aria-label') || '');
+                            var label = bt || bl;
+                            if (label === 'hủy' || label === 'cancel') {
+                                try { b.click(); return true; } catch(e) {}
+                            }
+                        }
+                    }
+                    return false;
+                    """
+                ))
+            except Exception:
+                return False
+
+            try:
+                return bool(self.driver.execute_script(
+                    """
+                    var action = arguments[0] || '';
+                    function norm(s){ return (s||'').toLowerCase(); }
+                    function textPack(el){
+                        if (!el) return '';
+                        var t = '';
+                        try { t += ' ' + (el.innerText || el.textContent || ''); } catch(e) {}
+                        try { t += ' ' + (el.getAttribute && (el.getAttribute('aria-label') || '')) || ''; } catch(e) {}
+                        try { t += ' ' + (el.getAttribute && (el.getAttribute('data-tooltip-content') || '')) || ''; } catch(e) {}
+                        return norm(t);
+                    }
+                    function matchAction(s){
+                        if (!s) return false;
+                        if (action === 'approve') {
+                            return s.indexOf('phê duyệt') !== -1 || s.indexOf('phe duyet') !== -1 ||
+                                   s.indexOf('duyệt') !== -1 || s.indexOf('approve') !== -1 ||
+                                   s.indexOf('chấp thuận') !== -1 || s.indexOf('chap thuan') !== -1;
+                        }
+                        return s.indexOf('từ chối') !== -1 || s.indexOf('tu choi') !== -1 ||
+                               s.indexOf('decline') !== -1 || s.indexOf('reject') !== -1;
+                    }
+                    function clickEl(el){
+                        try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch(e) {}
+                        try { el.click(); return true; } catch(e) { return false; }
+                    }
+                    var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    for (var i=0;i<btns.length;i++){
+                        var t = textPack(btns[i]);
+                        if (!matchAction(t)) continue;
+                        try { if (String(btns[i].getAttribute('aria-disabled')) === 'true') continue; } catch(e) {}
+                        if (clickEl(btns[i])) return true;
+                    }
+                    return false;
+                    """,
+                    action_name,
+                ))
+            except Exception:
+                return False
+
+        while rounds < max_rounds and not self.approval_stop_event.is_set():
+            rounds += 1
+            posts = _find_pending_posts()
+            if not posts:
+                if rounds == 1:
+                    self._log("ℹ Không tìm thấy bài chờ duyệt nào (hoặc giao diện khác).", "info")
+                break
+
+            processed = 0
+            approved = 0
+            rejected = 0
+            debug_clicked_fail_logged = False
+
+            for post in posts:
+                if self.approval_stop_event.is_set():
+                    break
+
+                if self._is_action_blocked():
+                    self._log("⛔ Facebook đang hạn chế thao tác, dừng duyệt.", "err")
+                    break
+
                 try:
-                    text = self.driver.execute_script(
-                        "return (arguments[0].innerText || arguments[0].textContent || '').toLowerCase();",
-                        post,
-                    )
-                except Exception:
-                    text = ""
+                    post_key = _get_post_key(post)
+                    if post_key and post_key in seen_post_keys:
+                        continue
 
-                text = text or ""
-                is_suspicious = False
-                for kw in blocked_keywords:
-                    if kw and kw in text:
-                        is_suspicious = True
-                        break
+                    # Lấy text bài viết
+                    try:
+                        text = self.driver.execute_script(
+                            "return (arguments[0].innerText || arguments[0].textContent || '').toLowerCase();",
+                            post,
+                        )
+                    except Exception:
+                        text = ""
 
-                action = None  # "approve" | "reject" | None
-                if is_suspicious:
-                    action = "reject"
-                elif self.approval_auto_approve_safe.get():
-                    action = "approve"
+                    text = text or ""
+                    is_suspicious = False
+                    for kw in blocked_keywords:
+                        if kw and kw in text:
+                            is_suspicious = True
+                            break
 
-                if not action:
+                    action = None  # "approve" | "reject" | None
+                    if is_suspicious:
+                        action = "reject"
+                    elif self.approval_auto_approve_safe.get():
+                        action = "approve"
+
+                    if not action:
+                        continue
+
+                    # Tìm nút phù hợp bên trong post
+                    if action == "approve":
+                        clicked = _click_action_in_post(post, "approve")
+                        if not clicked:
+                            clicked = _click_checkbox_then_bulk(post, "approve")
+                        if not clicked:
+                            clicked = _click_checkbox_then_bulk_by_element(post, "approve")
+                        if not clicked:
+                            clicked = _click_toolbar_action_near_pending_header("approve")
+                        if clicked:
+                            approved += 1
+                    else:
+                        clicked = _click_action_in_post(post, "reject")
+                        if not clicked:
+                            clicked = _click_checkbox_then_bulk(post, "reject")
+                        if not clicked:
+                            clicked = _click_checkbox_then_bulk_by_element(post, "reject")
+                        if not clicked:
+                            clicked = _click_toolbar_action_near_pending_header("reject")
+                        if clicked:
+                            rejected += 1
+
+                    if clicked:
+                        if post_key:
+                            seen_post_keys.add(post_key)
+                        processed += 1
+                        if action == "approve":
+                            try:
+                                # Cancel dialog: "Phê duyệt trước bài viết..."
+                                for _c in range(2):
+                                    if _cancel_preapprove_dialog():
+                                        self._log("  ✅ [Duyệt bài] Đã bấm Hủy phê duyệt trước", "info")
+                                        break
+                                    time.sleep(0.3)
+                                # Confirm dialog: "Đăng lên nhóm?"
+                                for _c in range(4):
+                                    if _confirm_post_to_group_dialog():
+                                        self._log("  ✅ [Duyệt bài] Đã xác nhận đăng lên nhóm", "info")
+                                        break
+                                    time.sleep(0.4)
+                            except Exception:
+                                pass
+                        time.sleep(1.0)
+                    else:
+                        self._log("  ⚠️ Không click được nút phê duyệt/từ chối (giao diện khác).", "warn")
+                        if not debug_clicked_fail_logged:
+                            debug_clicked_fail_logged = True
+                            try:
+                                snap = self.driver.execute_script(
+                                    r"""
+                                    function norm(s){ return (s||'').toLowerCase(); }
+                                    function textPack(el){
+                                        if (!el) return '';
+                                        var t = '';
+                                        try { t += ' ' + (el.innerText || el.textContent || ''); } catch(e) {}
+                                        try { t += ' ' + (el.getAttribute && (el.getAttribute('aria-label') || '')) || ''; } catch(e) {}
+                                        try { t += ' ' + (el.getAttribute && (el.getAttribute('data-tooltip-content') || '')) || ''; } catch(e) {}
+                                        return t.replace(/\s+/g,' ').trim();
+                                    }
+
+                                    var checkboxes = Array.from(document.querySelectorAll('[role="checkbox"], input[type="checkbox"]'));
+                                    var topButtons = Array.from(document.querySelectorAll('button, [role="button"]'))
+                                        .map(textPack)
+                                        .filter(function(t){ return t && t.length <= 40; })
+                                        .slice(0, 40);
+
+                                    // try to find toolbar-like area near header
+                                    var header = document.querySelector('h1, h2, h3');
+                                    var nearby = [];
+                                    if (header && header.getBoundingClientRect) {
+                                        var hr = header.getBoundingClientRect();
+                                        var btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                                        for (var i=0;i<btns.length && nearby.length < 20;i++){
+                                            var r = btns[i].getBoundingClientRect();
+                                            if (r.top >= hr.top - 40 && r.top <= hr.bottom + 120) {
+                                                var t = textPack(btns[i]);
+                                                if (t) nearby.push(t);
+                                            }
+                                        }
+                                    }
+
+                                    return {
+                                        checkboxCount: checkboxes.length,
+                                        sampleButtons: topButtons,
+                                        nearbyHeaderButtons: nearby
+                                    };
+                                    """
+                                ) or {}
+                                self._log(
+                                    f"  [dbg] checkbox={snap.get('checkboxCount')} "
+                                    f"btns={len(snap.get('sampleButtons') or [])} "
+                                    f"nearHeader={snap.get('nearbyHeaderButtons')}",
+                                    "debug",
+                                )
+                            except Exception:
+                                pass
+
+                except StaleElementReferenceException:
+                    # Bài viết đã bị FB reload / DOM thay đổi khi đang duyệt -> bỏ qua bài này
+                    self._log("⚠️ Một bài chờ duyệt đã thay đổi trong khi xử lý (stale element), bỏ qua bài đó.", "warn")
+                    continue
+                except Exception as e:
+                    self._log(f"⚠️ Lỗi khi xử lý một bài chờ duyệt: {e}", "warn")
                     continue
 
-                # Tìm nút phù hợp bên trong post
-                if action == "approve":
-                    clicked = self.driver.execute_script(
-                        """
-                        var root = arguments[0];
-                        if (!root) return false;
-                        function norm(s){return (s||'').toLowerCase();}
-                        var btns = root.querySelectorAll('button, [role="button"]');
-                        for (var i=0;i<btns.length;i++){
-                            var t = norm(btns[i].innerText || btns[i].textContent);
-                            if (!t) continue;
-                            if (t.indexOf('phê duyệt')!==-1 || t.indexOf('duyệt')!==-1 || t.indexOf('approve')!==-1 || t.indexOf('chấp thuận')!==-1){
-                                try { btns[i].click(); return true; } catch(e) {}
-                            }
-                        }
-                        return false;
-                        """,
-                        post,
-                    )
-                    if clicked:
-                        approved += 1
-                else:
-                    clicked = self.driver.execute_script(
-                        """
-                        var root = arguments[0];
-                        if (!root) return false;
-                        function norm(s){return (s||'').toLowerCase();}
-                        var btns = root.querySelectorAll('button, [role="button"]');
-                        for (var i=0;i<btns.length;i++){
-                            var t = norm(btns[i].innerText || btns[i].textContent);
-                            if (!t) continue;
-                            if (t.indexOf('từ chối')!==-1 || t.indexOf('tu choi')!==-1 || t.indexOf('decline')!==-1 || t.indexOf('reject')!==-1){
-                                try { btns[i].click(); return true; } catch(e) {}
-                            }
-                        }
-                        return false;
-                        """,
-                        post,
-                    )
-                    if clicked:
-                        rejected += 1
+            processed_total += processed
+            approved_total += approved
+            rejected_total += rejected
 
-                if clicked:
-                    processed += 1
-                    time.sleep(1.0)
+            try:
+                new_height = int(self.driver.execute_script(
+                    "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) || 0;"
+                ) or 0)
+            except Exception:
+                new_height = 0
 
-            except StaleElementReferenceException:
-                # Bài viết đã bị FB reload / DOM thay đổi khi đang duyệt -> bỏ qua bài này
-                self._log("⚠️ Một bài chờ duyệt đã thay đổi trong khi xử lý (stale element), bỏ qua bài đó.", "warn")
-                continue
-            except Exception as e:
-                self._log(f"⚠️ Lỗi khi xử lý một bài chờ duyệt: {e}", "warn")
-                continue
+            if new_height <= (last_scroll_height + 10):
+                no_growth_rounds += 1
+            else:
+                no_growth_rounds = 0
+                last_scroll_height = new_height
+
+            try:
+                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception:
+                pass
+            time.sleep(1.4)
+
+            if processed == 0 and no_growth_rounds >= 2:
+                break
 
         self._log(
-            f"✅ [Duyệt bài] Đã xử lý {processed} bài (phê duyệt {approved}, từ chối {rejected}) trong {group_url}",
+            f"✅ [Duyệt bài] Đã xử lý {processed_total} bài (phê duyệt {approved_total}, từ chối {rejected_total}) trong {group_url}",
             "ok",
         )
+
+    # ── Auto đăng bài nhóm ────────────────────────────────────────────────
+    def _start_group_posting(self):
+        if not self.logged_in:
+            messagebox.showwarning("Chưa đăng nhập", "Vui lòng đăng nhập Facebook trước!")
+            return
+
+        selected = [url for url, data in self.group_post_selected_groups.items() if data['var'].get()]
+        if not selected:
+            messagebox.showwarning("Chưa chọn nhóm", "Vui lòng chọn ít nhất 1 nhóm để đăng bài!")
+            return
+
+        enabled_slots = [s for s in self.group_post_slots if s["enabled"].get()]
+        if not enabled_slots:
+            messagebox.showwarning("Thiếu nội dung", "Vui lòng bật ít nhất 1 mẫu nội dung để đăng!")
+            return
+
+        mode = self.group_post_mode_var.get()
+        self.group_post_stop_event.clear()
+        self.group_post_schedule_stop_event.clear()
+        self._set_run_buttons(self.btn_start_group_post, self.btn_stop_group_post, True, ACCENT, "#e74c3c")
+        self._log(f"▶️ [Nhóm] Bắt đầu auto đăng bài ({mode}) cho {len(selected)} nhóm", "info")
+
+        if mode == "schedule":
+            self.group_post_last_run_keys.clear()
+            self.group_post_schedule_thread = threading.Thread(
+                target=self._group_post_schedule_worker, args=(selected,), daemon=True
+            )
+            self.group_post_schedule_thread.start()
+        else:
+            self.group_post_thread = threading.Thread(
+                target=self._group_post_interval_worker, args=(selected,), daemon=True
+            )
+            self.group_post_thread.start()
+
+    def _stop_group_posting(self):
+        self.group_post_stop_event.set()
+        self.group_post_schedule_stop_event.set()
+        self._set_run_buttons(self.btn_start_group_post, self.btn_stop_group_post, False, ACCENT, "#e74c3c")
+        self._log("⏹ [Nhóm] Đã yêu cầu dừng auto đăng bài", "warn")
+
+    def _get_group_post_templates(self):
+        templates = []
+        for slot in self.group_post_slots:
+            if not slot["enabled"].get():
+                continue
+            text = ""
+            try:
+                tw = slot.get("text_widget")
+                if tw is not None:
+                    text = tw.get("1.0", "end-1c").strip()
+            except Exception:
+                text = ""
+            img = slot.get("image").get().strip() if slot.get("image") else ""
+            if text or img:
+                templates.append({"text": text, "image": img})
+        return templates
+
+    def _get_group_post_daily_counts(self):
+        today = dt.datetime.now().strftime("%Y-%m-%d")
+        stored = self.group_post_daily_counts or {}
+        if stored.get("date") != today:
+            self.group_post_daily_counts = {"date": today, "counts": {}}
+        if "counts" not in self.group_post_daily_counts:
+            self.group_post_daily_counts["counts"] = {}
+        return self.group_post_daily_counts["counts"]
+
+    def _group_post_interval_worker(self, group_urls):
+        try:
+            templates = self._get_group_post_templates()
+            if not templates:
+                self._log("⚠️ [Nhóm] Không có mẫu nội dung hợp lệ.", "warn")
+                return
+
+            tpl_mode = self.group_post_template_mode_var.get()
+            tpl_idx = 0
+            while not self.group_post_stop_event.is_set():
+                session_target = random.randint(
+                    max(1, int(self.group_post_session_group_min_var.get() or 1)),
+                    max(1, int(self.group_post_session_group_max_var.get() or 1))
+                )
+                session_done = 0
+
+                for i, group_url in enumerate(group_urls):
+                    if self.group_post_stop_event.is_set():
+                        break
+                    if self._is_action_blocked():
+                        self._log("⛔ [Nhóm] Facebook đang hạn chế thao tác, dừng.", "err")
+                        self.group_post_stop_event.set()
+                        break
+
+                    if self.group_post_skip_pending_var.get():
+                        required = self.group_post_pending_required.get(group_url)
+                        if required is None:
+                            required = self._detect_group_post_requires_approval(group_url)
+                            if required is not None:
+                                self._set_group_post_pending_required(group_url, required)
+                        if required:
+                            group_name = self.group_post_selected_groups.get(group_url, {}).get("name", group_url)
+                            self._log(f"⏭️ [Nhóm] Bỏ qua nhóm cần kiểm duyệt: {group_name}", "warn")
+                            continue
+
+                    counts = self._get_group_post_daily_counts()
+                    daily_limit = max(1, int(self.group_post_daily_limit_var.get() or 1))
+                    if counts.get(group_url, 0) >= daily_limit:
+                        continue
+
+                    if tpl_mode == "random":
+                        tpl = random.choice(templates)
+                    else:
+                        tpl = templates[tpl_idx % len(templates)]
+                        tpl_idx += 1
+
+                    group_name = self.group_post_selected_groups.get(group_url, {}).get("name", group_url)
+                    self._log(f"🧾 [Nhóm] Đăng bài vào: {group_name}", "info")
+                    ok = self._post_to_profile(
+                        tpl.get("text"),
+                        tpl.get("image"),
+                        target_url=group_url,
+                        stop_event=self.group_post_stop_event,
+                        log_tag="[Nhóm]",
+                    )
+                    if ok:
+                        counts[group_url] = counts.get(group_url, 0) + 1
+                        self._log(f"✅ [Nhóm] Đã đăng: {group_name}", "ok")
+                    else:
+                        self._log(f"⚠️ [Nhóm] Đăng có thể chưa thành công: {group_name}", "warn")
+
+                    session_done += 1
+                    if session_done >= session_target and i < (len(group_urls) - 1):
+                        rest_min = int(self.group_post_session_rest_min_var.get() or 1)
+                        rest_max = int(self.group_post_session_rest_max_var.get() or rest_min)
+                        rest = max(1, random.randint(rest_min, rest_max))
+                        self._log(f"💤 [Nhóm] Nghỉ giữa phiên {rest} phút...", "info")
+                        if self.group_post_stop_event.wait(rest * 60):
+                            break
+                        session_done = 0
+                        session_target = random.randint(
+                            max(1, int(self.group_post_session_group_min_var.get() or 1)),
+                            max(1, int(self.group_post_session_group_max_var.get() or 1))
+                        )
+
+                    rest_min = int(self.group_post_group_rest_min_var.get() or 0)
+                    rest_max = int(self.group_post_group_rest_max_var.get() or rest_min)
+                    rest = max(0, random.randint(rest_min, rest_max))
+                    if rest > 0 and self.group_post_stop_event.wait(rest * 60):
+                        break
+
+                if self.group_post_stop_event.is_set():
+                    break
+
+                wait_min = max(1, int(self.group_post_interval_min_var.get() or 1))
+                wait_max = max(wait_min, int(self.group_post_interval_max_var.get() or wait_min))
+                wait_minutes = random.randint(wait_min, wait_max)
+                self._log(f"⏳ [Nhóm] Chờ {wait_minutes} phút cho chu kỳ tiếp theo...", "info")
+                if self.group_post_stop_event.wait(wait_minutes * 60):
+                    break
+        finally:
+            self._log("🔕 [Nhóm] Đã dừng auto đăng bài", "warn")
+            try:
+                self.after(0, lambda: self._set_run_buttons(self.btn_start_group_post, self.btn_stop_group_post, False, ACCENT, "#e74c3c"))
+            except Exception:
+                pass
+
+    def _group_post_schedule_worker(self, group_urls):
+        try:
+            while not self.group_post_schedule_stop_event.is_set():
+                now = dt.datetime.now()
+                now_time = now.strftime("%H:%M")
+                weekday = now.strftime("%a")
+
+                for idx, slot in enumerate(self.group_post_slots):
+                    if self.group_post_schedule_stop_event.is_set():
+                        break
+                    if not slot["enabled"].get():
+                        continue
+
+                    mode = slot["mode"].get()
+                    times_raw = (slot["times"].get() or "").strip()
+                    times = [t.strip() for t in times_raw.split(",") if t.strip()]
+                    if not times:
+                        continue
+
+                    if mode == "weekly" and slot["weekday"].get() != weekday:
+                        continue
+
+                    for t in times:
+                        run_key = f"{idx}:{mode}:{weekday}:{t}:{now.strftime('%Y-%m-%d')}"
+                        if run_key in self.group_post_last_run_keys:
+                            continue
+                        if t != now_time:
+                            continue
+
+                        text = ""
+                        try:
+                            tw = slot.get("text_widget")
+                            if tw is not None:
+                                text = tw.get("1.0", "end-1c").strip()
+                        except Exception:
+                            text = ""
+                        img = slot.get("image").get().strip() if slot.get("image") else ""
+                        if not text and not img:
+                            self.group_post_last_run_keys.add(run_key)
+                            continue
+
+                        self._log(f"🕒 [Nhóm] Đến giờ đăng mẫu {idx+1} ({mode})", "info")
+                        for group_url in group_urls:
+                            if self.group_post_schedule_stop_event.is_set():
+                                break
+                            counts = self._get_group_post_daily_counts()
+                            daily_limit = max(1, int(self.group_post_daily_limit_var.get() or 1))
+                            if counts.get(group_url, 0) >= daily_limit:
+                                continue
+
+                            if self.group_post_skip_pending_var.get():
+                                required = self.group_post_pending_required.get(group_url)
+                                if required is None:
+                                    required = self._detect_group_post_requires_approval(group_url)
+                                    if required is not None:
+                                        self._set_group_post_pending_required(group_url, required)
+                                if required:
+                                    group_name = self.group_post_selected_groups.get(group_url, {}).get("name", group_url)
+                                    self._log(f"⏭️ [Nhóm] Bỏ qua nhóm cần kiểm duyệt: {group_name}", "warn")
+                                    continue
+
+                            group_name = self.group_post_selected_groups.get(group_url, {}).get("name", group_url)
+                            self._log(f"🧾 [Nhóm] Đăng bài vào: {group_name}", "info")
+                            ok = self._post_to_profile(
+                                text,
+                                img,
+                                target_url=group_url,
+                                stop_event=self.group_post_schedule_stop_event,
+                                log_tag="[Nhóm]",
+                            )
+                            if ok:
+                                counts[group_url] = counts.get(group_url, 0) + 1
+                                self._log(f"✅ [Nhóm] Đã đăng: {group_name}", "ok")
+                            else:
+                                self._log(f"⚠️ [Nhóm] Đăng có thể chưa thành công: {group_name}", "warn")
+
+                            rest_min = int(self.group_post_group_rest_min_var.get() or 0)
+                            rest_max = int(self.group_post_group_rest_max_var.get() or rest_min)
+                            rest = max(0, random.randint(rest_min, rest_max))
+                            if rest > 0 and self.group_post_schedule_stop_event.wait(rest * 60):
+                                break
+
+                        self.group_post_last_run_keys.add(run_key)
+
+                if self.group_post_schedule_stop_event.wait(20):
+                    break
+        finally:
+            self._log("🔕 [Nhóm] Đã dừng auto đăng bài", "warn")
+            try:
+                self.after(0, lambda: self._set_run_buttons(self.btn_start_group_post, self.btn_stop_group_post, False, ACCENT, "#e74c3c"))
+            except Exception:
+                pass
     
     def _start_commenting(self):
         """Start commenting on selected groups."""
@@ -5349,7 +7210,7 @@ class App(tk.Tk):
     
     def _comment_sequential(self, group_urls, comment_text):
         """Comment on groups sequentially (one by one)."""
-        img_path = self._pick_comment_image()
+        img_path = self.comment_image_path.get().strip()
         post_count = self.comment_post_count.get()
         comment_old = bool(self.comment_old_posts_var.get())
         total_commented = 0
@@ -5372,7 +7233,7 @@ class App(tk.Tk):
                     time.sleep(3)
 
                     # Comment on old posts (check_duplicates=False for first run)
-                    cmt_count = self._comment_on_group_posts(comment_text, img_path, post_count, check_duplicates=False)
+                    cmt_count = self._comment_on_group_posts(comment_text, img_path, post_count, check_duplicates=False, group_url=group_url)
                     try:
                         total_commented += int(cmt_count or 0)
                         self._comment_session_total += int(cmt_count or 0)
@@ -5433,7 +7294,7 @@ class App(tk.Tk):
         self._log("⚠️ Chế độ song song chưa hỗ trợ. Dùng tuần tự...", "warn")
         self._comment_sequential(group_urls, comment_text)
     
-    def _comment_on_group_posts(self, comment_text, img_path, post_count=3, check_duplicates=True):
+    def _comment_on_group_posts(self, comment_text, img_path, post_count=3, check_duplicates=True, group_url=None):
         """Find recent posts in current group and comment.
         
         Args:
@@ -5464,52 +7325,57 @@ class App(tk.Tk):
             
             # Find posts - look for article elements or feed posts
             from selenium.webdriver.common.action_chains import ActionChains
-            
-            posts = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
 
-            # Dedupe articles by permalink/story id to avoid commenting multiple times on the same post
-            unique_posts = []
             seen_post_ids = set()
-            for p in posts:
-                try:
-                    pid = self.driver.execute_script(
-                        """
-                        var art = arguments[0];
-                        if (!art) return '';
-                        var links = art.querySelectorAll('a[href]');
-                        for (var i=0;i<links.length;i++) {
-                            var href = links[i].href || '';
-                            if (!href) continue;
-                            if (href.indexOf('/permalink/') !== -1) return href.split('?')[0];
-                            if (href.indexOf('/posts/') !== -1) return href.split('?')[0];
-                            if (href.indexOf('story_fbid=') !== -1 && href.indexOf('id=') !== -1) {
-                                var m = href.match(/story_fbid=([^&]+)/);
-                                var n = href.match(/id=([^&]+)/);
-                                if (m && n) return (n[1] + ':' + m[1]);
+
+            def _collect_unique_posts(post_list):
+                unique = []
+                for p in post_list:
+                    try:
+                        pid = self.driver.execute_script(
+                            """
+                            var art = arguments[0];
+                            if (!art) return '';
+                            var links = art.querySelectorAll('a[href]');
+                            for (var i=0;i<links.length;i++) {
+                                var href = links[i].href || '';
+                                if (!href) continue;
+                                if (href.indexOf('/permalink/') !== -1) return href.split('?')[0];
+                                if (href.indexOf('/posts/') !== -1) return href.split('?')[0];
+                                if (href.indexOf('story_fbid=') !== -1 && href.indexOf('id=') !== -1) {
+                                    var m = href.match(/story_fbid=([^&]+)/);
+                                    var n = href.match(/id=([^&]+)/);
+                                    if (m && n) return (n[1] + ':' + m[1]);
+                                }
                             }
-                        }
-                        // Fallback: hash of visible text snippet
-                        var t = (art.innerText || '').trim();
-                        return t ? ('txt:' + t.slice(0,120)) : '';
-                        """,
-                        p,
-                    )
-                except Exception:
-                    pid = ''
+                            // Fallback: hash of visible text snippet
+                            var t = (art.innerText || '').trim();
+                            return t ? ('txt:' + t.slice(0,120)) : '';
+                            """,
+                            p,
+                        )
+                    except Exception:
+                        pid = ''
 
-                if not pid:
-                    continue
-                if pid in seen_post_ids:
-                    continue
-                seen_post_ids.add(pid)
-                unique_posts.append(p)
+                    if not pid:
+                        continue
+                    if pid in seen_post_ids:
+                        continue
+                    seen_post_ids.add(pid)
+                    unique.append(p)
+                return unique
 
+            posts = self.driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
+            unique_posts = _collect_unique_posts(posts)
             if unique_posts:
                 posts = unique_posts
             
             if not check_duplicates:
                 # First run: comment on specified number of posts
-                posts_to_process = min(len(posts), post_count)
+                try:
+                    posts_to_process = max(1, int(post_count) if post_count else 1)
+                except Exception:
+                    posts_to_process = 3
                 self._log(f"  🔍 Tìm thấy {len(posts)} bài, sẽ comment vào {posts_to_process} bài", "info")
             else:
                 # Monitor mode: check all posts for new ones
@@ -5525,9 +7391,22 @@ class App(tk.Tk):
 
             commented_uids_this_run = set()
             scanned_idx = 0
+            force_text_only = False
+            force_text_only_logged = False
+            if group_url and group_url in self.comment_group_text_only:
+                force_text_only = True
+                img_path = ""
+                force_text_only_logged = True
+                self._log("  🧷 Nhóm đã ghi nhớ: dùng chữ thuần, bỏ ảnh/số.", "info")
 
             # Scan posts until we comment enough distinct posts (Phase 1)
-            for idx, post in enumerate(posts):
+            post_index = 0
+            extra_scrolls = 0
+            max_extra_scrolls = max(10, int(post_count) * 8)
+            no_new_rounds = 0
+            last_scroll_height = 0
+
+            while self.is_commenting:
                 if not self.is_commenting:
                     break
 
@@ -5546,9 +7425,62 @@ class App(tk.Tk):
                 # Monitor mode: stop after reaching cap for this group
                 if check_duplicates and (commented_count >= posts_to_process):
                     break
-                    
+
+                if post_index >= len(posts):
+                    if check_duplicates:
+                        break
+
+                    if extra_scrolls >= max_extra_scrolls:
+                        if not check_duplicates:
+                            self._log("  🛑 Đã cuộn đủ số lần nhưng chưa tìm thêm bài mới.", "info")
+                        break
+
+                    # Scroll to load more posts when we still need comments
+                    if not check_duplicates:
+                        self._log(f"  📜 Cuộn thêm để tìm bài ({extra_scrolls + 1}/{max_extra_scrolls})...", "info")
+                    try:
+                        last_scroll_height = int(self.driver.execute_script(
+                            "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) || 0;"
+                        ) or 0)
+                    except Exception:
+                        last_scroll_height = 0
+
+                    # Jump to bottom to force load (more effective than small increments on FB)
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2.8)
+
+                    try:
+                        new_scroll_height = int(self.driver.execute_script(
+                            "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight) || 0;"
+                        ) or 0)
+                    except Exception:
+                        new_scroll_height = 0
+
+                    if new_scroll_height <= last_scroll_height:
+                        # Fallback: small nudge if height didn't change
+                        self.driver.execute_script("window.scrollBy(0, 1200);")
+                        time.sleep(1.6)
+                    extra_scrolls += 1
+
+                    new_posts = _collect_unique_posts(
+                        self.driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
+                    )
+                    if new_posts:
+                        posts.extend(new_posts)
+                        no_new_rounds = 0
+                    else:
+                        no_new_rounds += 1
+                        if no_new_rounds >= 4:
+                            if not check_duplicates:
+                                self._log("  💤 Cuộn thêm nhưng không thấy bài mới, dừng sớm.", "info")
+                            break
+                    continue
+
                 try:
                     scanned_idx += 1
+
+                    post = posts[post_index]
+                    post_index += 1
 
                     # Post UID (used to prevent commenting multiple times on the same post)
                     post_uid = ""
@@ -5775,6 +7707,27 @@ class App(tk.Tk):
 
                     comment_elements = _pick_comment_boxes(post_scope)
 
+                    # Retry: click "Bình luận/Comment" and wait longer before searching again
+                    if not comment_elements:
+                        for _retry in range(2):
+                            try:
+                                comment_btns = post_scope.find_elements(
+                                    By.XPATH,
+                                    "(.//*[@role='button' or @role='link'][contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'bình luận') or contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'comment')])[1]"
+                                )
+                                if comment_btns:
+                                    self.driver.execute_script(
+                                        "arguments[0].scrollIntoView({block:'center'}); arguments[0].click();",
+                                        comment_btns[0],
+                                    )
+                                    time.sleep(1.6)
+                            except Exception:
+                                pass
+
+                            comment_elements = _pick_comment_boxes(post_scope)
+                            if comment_elements:
+                                break
+
                     # If not found, click the Comment button to open the composer, then search again
                     if not comment_elements:
                         try:
@@ -5965,9 +7918,11 @@ class App(tk.Tk):
                     
                     if comment_elements:
                         comment_success = False
+                        retry_text_only = False
+                        rejected_reason = ""
                         
                         # Try to click and comment with retry mechanism
-                        for attempt in range(3):  # 3 attempts
+                        for attempt in range(4):  # extra attempt for text-only retry
                             try:
                                 if not self.is_commenting:
                                     break
@@ -6039,6 +7994,11 @@ class App(tk.Tk):
                                 comment_text = self._build_comment_text()
                                 if not comment_text:
                                     raise Exception("Empty comment text")
+
+                                if retry_text_only or force_text_only:
+                                    comment_text = self._sanitize_text_for_pending(comment_text)
+                                    if not comment_text:
+                                        raise Exception("Empty text after removing links")
 
                                 pasted_ok = False
                                 try:
@@ -6125,7 +8085,14 @@ class App(tk.Tk):
                                 time.sleep(0.6)
 
                                 # Attach image if provided
-                                img_choice = img_path if img_path else self._pick_comment_image()
+                                if retry_text_only or force_text_only:
+                                    img_choice = ""
+                                else:
+                                    pool = self._get_comment_images()
+                                    if pool:
+                                        img_choice = random.choice(pool)
+                                    else:
+                                        img_choice = img_path
                                 if img_choice and os.path.isfile(img_choice):
                                     try:
                                         file_input = None
@@ -6226,6 +8193,38 @@ class App(tk.Tk):
                                 if not submitted:
                                     raise Exception("Comment may not have been submitted")
 
+                                # Detect auto-rejected or pending comment (may render a bit later)
+                                pending_reason = ""
+                                for _ in range(12):
+                                    time.sleep(0.6)
+                                    rejected_reason = self._detect_rejected_comment(post)
+                                    if rejected_reason:
+                                        break
+                                    pending_reason = self._detect_pending_comment(post)
+                                    if pending_reason:
+                                        break
+
+                                if rejected_reason:
+                                    if not retry_text_only:
+                                        self._log("  ⚠️ Bình luận bị từ chối, thử lại bằng chữ thuần...", "warn")
+                                        retry_text_only = True
+                                        comment_success = False
+                                        continue
+                                    self._log("  ⛔ Bình luận chữ thuần vẫn bị từ chối, bỏ qua bài này.", "warn")
+                                    comment_success = False
+                                    break
+
+                                if pending_reason and not force_text_only:
+                                    self._log("  ⚠️ Comment đang chờ duyệt → chuyển sang chữ thuần, bỏ ảnh/số.", "warn")
+                                    force_text_only = True
+                                    img_path = ""
+                                    if not force_text_only_logged:
+                                        force_text_only_logged = True
+                                    if group_url:
+                                        if group_url not in self.comment_group_text_only:
+                                            self.comment_group_text_only.add(group_url)
+                                            self._log("  🧷 Ghi nhớ nhóm: luôn dùng chữ thuần, bỏ ảnh/số.", "info")
+
                                 comment_success = True
                                 break  # Success, exit retry loop
                                 
@@ -6234,7 +8233,7 @@ class App(tk.Tk):
                                     if not check_duplicates:
                                         # Shortened error message
                                         err_msg = str(click_err).split('\n')[0][:80]
-                                        self._log(f"  ❌ [{idx+1}] Lỗi: {err_msg}", "err")
+                                        self._log(f"  ❌ [{scanned_idx}] Lỗi: {err_msg}", "err")
                                 # Continue to next attempt
                         
                         if comment_success:
@@ -6402,11 +8401,13 @@ class App(tk.Tk):
         return [p for p in items if os.path.isfile(p)]
 
     def _pick_comment_image(self):
+        pool = self._get_comment_images()
+        if pool:
+            return random.choice(pool)
         img = self.comment_image_path.get().strip()
         if img and os.path.isfile(img):
             return img
-        pool = self._get_comment_images()
-        return random.choice(pool) if pool else ""
+        return ""
     
     def _start_monitor(self):
         """Start monitoring for new posts."""
@@ -6438,7 +8439,7 @@ class App(tk.Tk):
                 time.sleep(2)
 
                 uids = self.driver.execute_script(
-                    """
+                    r"""
                     var cap = Math.max(1, parseInt(arguments[0] || 3, 10));
                     var out = [];
                     var seen = new Set();
@@ -6546,8 +8547,8 @@ class App(tk.Tk):
                     
                     # Comment on new posts only (check_duplicates=True)
                     # Use smaller count for monitoring (just check recent posts)
-                    cmt_count = self._comment_on_group_posts(comment_text, self._pick_comment_image(), 
-                                                 post_count=monitor_cap, check_duplicates=True)
+                    cmt_count = self._comment_on_group_posts(comment_text, self.comment_image_path.get().strip(),
+                                                 post_count=monitor_cap, check_duplicates=True, group_url=group_url)
                     try:
                         self._comment_session_total += int(cmt_count or 0)
                     except Exception:
@@ -6594,7 +8595,8 @@ class App(tk.Tk):
                 "comment_session_rest_max": self.comment_session_rest_max_var.get(),
                 "monitor_enabled": self.monitor_enabled_var.get(),
                 "monitor_interval": self.monitor_interval_var.get(),
-                "selected_groups": [url for url, data in self.selected_groups.items() if data['var'].get()]
+                "selected_groups": [url for url, data in self.selected_groups.items() if data['var'].get()],
+                "comment_group_text_only": sorted(self.comment_group_text_only),
             }
             
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -6613,6 +8615,60 @@ class App(tk.Tk):
             
         except Exception as e:
             self._log(f"❌ Lỗi lưu config: {e}", "err")
+
+    def _save_group_post_config(self):
+        try:
+            slots = []
+            for s in self.group_post_slots:
+                text = ""
+                try:
+                    tw = s.get("text_widget")
+                    if tw is not None:
+                        text = tw.get("1.0", "end-1c").strip()
+                except Exception:
+                    text = ""
+                slots.append({
+                    "enabled": bool(s["enabled"].get()),
+                    "mode": s["mode"].get(),
+                    "times": s["times"].get(),
+                    "weekday": s["weekday"].get(),
+                    "image": s["image"].get(),
+                    "text": text,
+                })
+
+            config = {
+                "slots": slots,
+                "mode": self.group_post_mode_var.get(),
+                "template_mode": self.group_post_template_mode_var.get(),
+                "skip_pending_groups": bool(self.group_post_skip_pending_var.get()),
+                "pending_required": self.group_post_pending_required,
+                "interval_min": self.group_post_interval_min_var.get(),
+                "interval_max": self.group_post_interval_max_var.get(),
+                "group_rest_min": self.group_post_group_rest_min_var.get(),
+                "group_rest_max": self.group_post_group_rest_max_var.get(),
+                "session_group_min": self.group_post_session_group_min_var.get(),
+                "session_group_max": self.group_post_session_group_max_var.get(),
+                "session_rest_min": self.group_post_session_rest_min_var.get(),
+                "session_rest_max": self.group_post_session_rest_max_var.get(),
+                "daily_limit": self.group_post_daily_limit_var.get(),
+                "selected_groups": list(self.group_post_selected_urls),
+                "daily_counts": self.group_post_daily_counts,
+            }
+
+            with open(self.group_post_config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+
+            self._log(f"💾 [Nhóm] Đã lưu cấu hình: {self.group_post_config_file}", "ok")
+            messagebox.showinfo("Thành công", "Đã lưu cấu hình đăng bài nhóm!")
+
+            try:
+                if self.group_post_groups_all:
+                    self._save_group_cache(self.group_post_groups_cache_file, self.group_post_groups_all, list(self.group_post_selected_urls))
+            except Exception:
+                pass
+
+        except Exception as e:
+            self._log(f"❌ [Nhóm] Lỗi lưu config: {e}", "err")
     
     def _load_comment_config(self):
         """Load comment configuration from JSON."""
@@ -6628,6 +8684,67 @@ class App(tk.Tk):
             
         except Exception as e:
             print(f"Load config error: {e}")
+
+    def _load_group_post_config(self):
+        try:
+            if not os.path.exists(self.group_post_config_file):
+                return
+            with open(self.group_post_config_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            self.after(100, lambda: self._apply_loaded_group_post_config(config))
+        except Exception:
+            pass
+
+    def _apply_loaded_group_post_config(self, config):
+        try:
+            if not isinstance(config, dict):
+                return
+
+            slots = config.get("slots") or []
+            for idx, slot in enumerate(self.group_post_slots):
+                if idx >= len(slots):
+                    continue
+                data = slots[idx] or {}
+                try:
+                    slot["enabled"].set(bool(data.get("enabled")))
+                    slot["mode"].set(data.get("mode") or "daily")
+                    slot["times"].set(data.get("times") or "08:00")
+                    slot["weekday"].set(data.get("weekday") or "Mon")
+                    slot["image"].set(data.get("image") or "")
+                    tw = slot.get("text_widget")
+                    if tw is not None:
+                        tw.delete("1.0", "end")
+                        tw.insert("1.0", data.get("text") or "")
+                except Exception:
+                    pass
+
+            self.group_post_mode_var.set(config.get("mode") or "interval")
+            self.group_post_template_mode_var.set(config.get("template_mode") or "sequential")
+            self.group_post_skip_pending_var.set(bool(config.get("skip_pending_groups", False)))
+            self.group_post_interval_min_var.set(int(config.get("interval_min") or 60))
+            self.group_post_interval_max_var.set(int(config.get("interval_max") or 120))
+            self.group_post_group_rest_min_var.set(int(config.get("group_rest_min") or 2))
+            self.group_post_group_rest_max_var.set(int(config.get("group_rest_max") or 5))
+            self.group_post_session_group_min_var.set(int(config.get("session_group_min") or 10))
+            self.group_post_session_group_max_var.set(int(config.get("session_group_max") or 20))
+            self.group_post_session_rest_min_var.set(int(config.get("session_rest_min") or 30))
+            self.group_post_session_rest_max_var.set(int(config.get("session_rest_max") or 60))
+            self.group_post_daily_limit_var.set(int(config.get("daily_limit") or 1))
+
+            try:
+                pending_map = config.get("pending_required") or {}
+                if isinstance(pending_map, dict):
+                    self.group_post_pending_required = {str(k): bool(v) for k, v in pending_map.items()}
+            except Exception:
+                self.group_post_pending_required = {}
+
+            self.group_post_daily_counts = config.get("daily_counts") or {}
+            self.group_post_selected_urls = set(config.get("selected_groups") or [])
+            if self.group_post_groups_all:
+                self._update_group_post_list(self.group_post_groups_all, selected_set=self.group_post_selected_urls, update_source=False)
+            self._update_group_post_selected_count()
+        except Exception:
+            pass
     
     def _apply_loaded_config(self, config):
         """Apply loaded config to UI."""
@@ -6701,6 +8818,12 @@ class App(tk.Tk):
                     self._pending_selected_group_urls = set(config.get('selected_groups') or [])
                 except Exception:
                     self._pending_selected_group_urls = set()
+
+            if 'comment_group_text_only' in config:
+                try:
+                    self.comment_group_text_only = set(config.get('comment_group_text_only') or [])
+                except Exception:
+                    self.comment_group_text_only = set()
 
             self._update_comment_selected_count()
             

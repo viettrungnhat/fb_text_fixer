@@ -1,0 +1,69 @@
+{
+  "slots": [
+    {
+      "enabled": true,
+      "mode": "daily",
+      "times": "13:00",
+      "weekday": "Mon",
+      "image": "C:/Users/Admin/Downloads/pngtree-girls-doctoral-clothes-for-graduation-season-png-image_4560794.png",
+      "text": "LUẬN VĂN VIỆT - TRUNG - NHẬT: CHẤT LƯỢNG VÀNG - HỖ TRỢ TẬN TÂM \nBạn đang đối mặt với deadline \"ngộp thở\"? Bạn gặp khó khăn khi triển khai bài viết bằng tiếng Trung, tiếng Nhật hay đang lo lắng về tỷ lệ đạo văn (Turnitin, Chazhong)?\n🌟 Luận Văn Việt Trung Nhật – Đơn vị tư vấn và hỗ trợ học thuật đa ngôn ngữ uy tín hàng đầu, giúp bạn vượt qua mọi kỳ thi và bảo vệ thành công mọi cấp độ!\n✅ DỊCH VỤ TOÀN DIỆN & ĐA NGÔN NGỮ\nChúng tôi nhận tư vấn, hướng dẫn nghiên cứu bằng Tiếng Việt, Tiếng Trung (Giản/Phồn), Tiếng Nhật:\nMọi cấp độ: Luận văn Thạc sĩ, Tiến sĩ, Khóa luận tốt nghiệp, Tiểu luận, Bài tập lớn...\nMọi thể loại: Đề cương (Kaiti), Kế hoạch học tập (Study Plan), Thư giới thiệu, Bài đăng báo khoa học.\nMọi chuyên ngành: Kinh tế, Ngôn ngữ, Văn hóa, Luật, Xã hội...\n✨ TẠI SAO BẠN NÊN CHỌN CHÚNG TÔI?\nChuyên nghiệp: Logic rõ ràng, chuẩn định dạng học thuật, văn phong sắc sảo.\nAn tâm 100%: Bao check đạo văn trên mọi nền tảng (Turnitin, Chazhong...).\nBảo mật: Thông tin khách hàng và dữ liệu bài viết được bảo mật tuyệt đối.\nTận tâm: Hỗ trợ chỉnh sửa theo yêu cầu của giảng viên cho đến khi hoàn thành.\n🌏 代写/咨询各种论文 - 越·中·日论文专家\n• 专业代写本科、硕士、博士论文，开题报告，期刊论文。\n• 涵盖语言：越南语、中文（简/繁）、日语。\n• 承诺：100%原创，包查重（Turnitin, Chazhong...），严守秘密。\n🌏 ベトナム語、中国語、日本語の論文執筆サポート\n• 卒業論文、修士論文、博士論文、レポート、雑誌記事の作成。\n• 威信と品質。チェックを確保する (Turnitin...)。\n📩 TƯ VẤN MIỄN PHÍ - LIÊN HỆ NGAY."
+    },
+    {
+      "enabled": false,
+      "mode": "daily",
+      "times": "08:00",
+      "weekday": "Mon",
+      "image": "",
+      "text": ""
+    },
+    {
+      "enabled": false,
+      "mode": "daily",
+      "times": "08:00",
+      "weekday": "Mon",
+      "image": "",
+      "text": ""
+    }
+  ],
+  "mode": "interval",
+  "template_mode": "sequential",
+  "interval_min": 60,
+  "interval_max": 120,
+  "group_rest_min": 2,
+  "group_rest_max": 5,
+  "session_group_min": 10,
+  "session_group_max": 20,
+  "session_rest_min": 30,
+  "session_rest_max": 60,
+  "daily_limit": 1,
+  "selected_groups": [
+    "https://www.facebook.com/groups/935308490630756",
+    "https://www.facebook.com/groups/689441974965697",
+    "https://www.facebook.com/groups/747960509297629",
+    "https://www.facebook.com/groups/760143287921079",
+    "https://www.facebook.com/groups/viettrungnhat",
+    "https://www.facebook.com/groups/339705627229834",
+    "https://www.facebook.com/groups/vieclamtiengnhathaiduong",
+    "https://www.facebook.com/groups/vieclamtiengtrunghaiduong",
+    "https://www.facebook.com/groups/1143095692719396",
+    "https://www.facebook.com/groups/4358329300860100",
+    "https://www.facebook.com/groups/luanvanviettrungnhat"
+  ],
+  "daily_counts": {
+    "date": "2026-03-14",
+    "counts": {
+      "https://www.facebook.com/groups/vieclamtiengnhathaiduong": 1,
+      "https://www.facebook.com/groups/vieclamtiengtrunghaiduong": 1,
+      "https://www.facebook.com/groups/viettrungnhat": 1,
+      "https://www.facebook.com/groups/luanvanviettrungnhat": 1,
+      "https://www.facebook.com/groups/339705627229834": 1,
+      "https://www.facebook.com/groups/4358329300860100": 1,
+      "https://www.facebook.com/groups/1143095692719396": 1,
+      "https://www.facebook.com/groups/747960509297629": 1,
+      "https://www.facebook.com/groups/689441974965697": 1,
+      "https://www.facebook.com/groups/760143287921079": 1,
+      "https://www.facebook.com/groups/485442427572678": 1,
+      "https://www.facebook.com/groups/935308490630756": 1
+    }
+  }
+}
